@@ -231,7 +231,7 @@ namespace CodexUsageBadge.Startup {
                     if(result!=0||count!=1||reason!=0||list[0].process.pid!=pid||
                         list[0].process.started.dwLowDateTime!=target.started.dwLowDateTime||
                         list[0].process.started.dwHighDateTime!=target.started.dwHighDateTime)
-                        return new {accepted=false,reason="ambiguous-target"};
+                        return new {accepted=false,reason="ambiguous-target",errorCode=result,processCount=count,rebootReason=reason};
                     if(!guard()) return new {accepted=false,reason="guard"};
                     // Zero flags: never RmForceShutdown. A refusing/hung app is left running.
                     var task=Task.Factory.StartNew(()=>RmShutdown(handle,0,IntPtr.Zero));
@@ -241,7 +241,7 @@ namespace CodexUsageBadge.Startup {
                             canceled=true; RmCancelCurrentTask(handle);
                         }
                     }
-                    return new {accepted=!canceled&&task.Result==0,reason=canceled?"canceled":task.Result==0?"closed":"quit-refused"};
+                    return new {accepted=!canceled&&task.Result==0,reason=canceled?"canceled":task.Result==0?"closed":"quit-refused",errorCode=task.Result};
                 }
             } finally { RmEndSession(handle); }
         }
