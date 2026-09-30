@@ -6,6 +6,7 @@ $temp=Join-Path ([IO.Path]::GetTempPath()) ('badge-startup-native-'+[guid]::NewG
 [void][IO.Directory]::CreateDirectory($temp)
 $fixture=Join-Path $temp 'Codex.exe'
 $child=$null
+$testFailure=$null
 function Assert($condition,$message) { if(!$condition) { throw $message } }
 function Stop-Fixture {
     [IO.File]::WriteAllText((Join-Path $temp 'stop'),'stop')
@@ -113,9 +114,21 @@ public class StartupFixture : Form {
     Assert (!$shown.shown) 'Changed input must prevent showing a replacement'
     Stop-Fixture
     Write-Host 'PASS native process identity/arguments, background guards, normal OS shutdown, refusal, hidden relaunch, input cancellation and stop guard'
+} catch {
+    $testFailure=$_
 } finally {
-    Stop-Fixture
-    $resolved=[IO.Path]::GetFullPath($temp)
-    if(!$resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()),[StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $resolved) -notlike 'badge-startup-native-*') { throw 'Unexpected cleanup path' }
-    Remove-Item -LiteralPath $resolved -Recurse -Force
+    try {
+        Stop-Fixture
+        $resolved=[IO.Path]::GetFullPath($temp)
+        if(!$resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()),[StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $resolved) -notlike 'badge-startup-native-*') { throw 'Unexpected cleanup path' }
+        # Windows can briefly retain a handle after process/compiler shutdown.
+        for($attempt=0; $attempt -lt 20; $attempt++) {
+            try { Remove-Item -LiteralPath $resolved -Recurse -Force; break }
+            catch { if($attempt -eq 19) { throw }; Start-Sleep -Milliseconds 250 }
+        }
+    } catch {
+        if(!$testFailure) { throw }
+        Write-Warning ('Fixture cleanup failed: '+$_.Exception.Message)
+    }
 }
+if($testFailure) { throw $testFailure }
