@@ -48,7 +48,10 @@ class StartupController {
       await this.adapter.record('attempt',{lastAttemptAt:this.lastAttemptAt,processKey:app.key});
       if(this.stopped)return;
       const quit=await this.adapter.quit(app,snapshot.inputStamp);
-      if(!quit.accepted) { await this.adapter.record('quit-refused'); return; }
+      if(!quit.accepted) { await this.adapter.record('quit-refused',{
+        reason:quit.reason||'unknown',errorCode:quit.errorCode??null,
+        processCount:quit.processCount??null,rebootReason:quit.rebootReason??null
+      }); return; }
       const deadline=this.now()+10000;
       let absent=null;
       while(!this.stopped&&this.now()<deadline) {

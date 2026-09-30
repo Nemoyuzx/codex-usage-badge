@@ -1,9 +1,10 @@
 param(
-    [ValidateSet('Install','Launch','Run','Uninstall','Status','Functions')][string]$Action = 'Status',
-    [string]$AppExe, [string]$NodeExe, [string]$CodexBin, [string]$CodexHome
+    [ValidateSet('Install','Launch','Run','Uninstall','Status','Update','CheckUpdate','UpdatesOn','UpdatesOff','Functions')][string]$Action = 'Status',
+    [string]$AppExe, [string]$NodeExe, [string]$CodexBin, [string]$CodexHome,
+    [switch]$DisableAutoUpdate, [switch]$AutomaticUpdate, [switch]$ForceUpdate
 )
 $ErrorActionPreference = 'Stop'
-$script:Version = '0.10.0'
+$script:Version = '0.10.1'
 $script:Owner = 'local.codexusagebadge.windows'
 
 function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
@@ -187,6 +188,22 @@ function Resolve-Configuration($Saved, $Overrides) {
 function Get-ManagerArguments([string]$Mode) {
     Join-NativeArguments @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$script:ManagerPath,'-Action',$Mode)
 }
+function Test-ConfigurationCurrent($Config) {
+    foreach ($key in @('AppExe','NodeExe','CodexBin')) {
+        if (!(Test-Path -LiteralPath $Config.$key -PathType Leaf)) { return $false }
+    }
+    # Explicit app paths stay pinned. Automatic paths follow Store updates even if
+    # Windows retains the previous package directory while the new one is running.
+    if (Get-Setting (Get-Setting $Config 'Overrides') 'AppExe') { return $true }
+    $latest = Get-AppCandidates $Config | Where-Object { Test-DesktopExecutable $_ } | Select-Object -First 1
+    return $latest -and $latest -ieq $Config.AppExe
+}
+function Stop-WorkerChildren($Agent, $Watcher, [string]$StopFile) {
+    if (!$Agent -and !$Watcher) { return }
+    Write-Utf8 $StopFile 'stop'
+    if ($Watcher -and !$Watcher.HasExited -and !$Watcher.WaitForExit(14000)) { $Watcher.Kill(); $Watcher.WaitForExit() }
+    if ($Agent -and !$Agent.HasExited -and !$Agent.WaitForExit(6000)) { $Agent.Kill(); $Agent.WaitForExit() }
+}
 function Initialize-ShortcutApi {
     if ('CodexUsageBadge.Shortcuts' -as [type]) { return }
     # WScript.Shell can lose Unicode shortcut paths on non-Chinese Windows locales.
@@ -302,11 +319,14 @@ function Run-Worker {
     $owned = $false
     $child = $null
     $startup = $null
+    $generationStop = $null
+    $nextUpdateCheck = [DateTime]::UtcNow.AddSeconds(30)
     try {
         try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
         if (!$owned) { return }
         # Login only starts observers. The guarded helper completes a NEW user launch.
         while (!(Test-Path -LiteralPath $script:StopPath)) {
+            $refresh = $false
             try {
                 $config = Resolve-Configuration (Read-Json $script:ConfigPath) $null
                 Write-Json $script:ConfigPath $config
@@ -318,7 +338,8 @@ function Run-Worker {
                 $env:CODEX_BADGE_BIN = $config.CodexBin
                 $env:CODEX_HOME = $config.CodexHome
                 $env:CODEX_BADGE_PORT = [string]$config.Port
-                $env:CODEX_BADGE_STOP_FILE = $script:StopPath
+                $generationStop = Join-Path $script:InstallRoot ('worker-stop-' + [guid]::NewGuid().ToString('N') + '.request')
+                $env:CODEX_BADGE_STOP_FILE = $generationStop
                 $child = Start-Process -FilePath $config.NodeExe -ArgumentList (Join-NativeArguments @((Join-Path $script:InstallRoot 'agent.cjs'))) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot ($stamp + '.out.log')) -RedirectStandardError (Join-Path $logRoot ($stamp + '.err.log'))
                 $startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
                 $startup = Start-Process -FilePath $config.NodeExe -ArgumentList (Join-NativeArguments @((Join-Path $script:InstallRoot 'startup/windows.cjs'))) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot ($stamp + '.startup.out.log')) -RedirectStandardError (Join-Path $logRoot ($stamp + '.startup.err.log'))
@@ -332,28 +353,45 @@ function Run-Worker {
                 }
                 if (!$ready) { throw '原生启动监测器未就绪，请检查日志。' }
                 Write-Json $script:StatePath @{ State = 'running'; Pid = $PID; AgentPid = $child.Id; StartupPid = $startup.Id; Version = $script:Version; StartedAt = [DateTime]::UtcNow.ToString('o') }
+                $nextPathCheck = [DateTime]::UtcNow.AddSeconds(5)
                 while (!$child.HasExited -and !$startup.HasExited) {
-                    if (Test-Path -LiteralPath $script:StopPath) {
-                        if (!$startup.WaitForExit(14000)) { $startup.Kill(); $startup.WaitForExit() }
-                        if (!$child.WaitForExit(6000)) { $child.Kill(); $child.WaitForExit() }
+                    if ([DateTime]::UtcNow -ge $nextUpdateCheck -and !(Test-Path -LiteralPath $script:StopPath)) {
+                        $nextUpdateCheck = [DateTime]::UtcNow.AddMinutes(5)
+                        if (Get-AutoUpdateEnabled) {
+                            Start-Process -FilePath $script:PowerShell -ArgumentList (Get-ManagerArguments 'CheckUpdate') -WindowStyle Hidden | Out-Null
+                        }
+                    }
+                    if ([DateTime]::UtcNow -ge $nextPathCheck) {
+                        $refresh = !(Test-ConfigurationCurrent $config)
+                        $nextPathCheck = [DateTime]::UtcNow.AddSeconds(5)
+                    }
+                    if ($refresh -or (Test-Path -LiteralPath $script:StopPath)) {
+                        if ($refresh) {
+                            Write-Json $script:StatePath @{ State = 'refreshing-client-path'; Pid = $PID; Version = $script:Version }
+                        }
+                        Stop-WorkerChildren $child $startup $generationStop
                         break
                     }
                     Start-Sleep -Milliseconds 400
                 }
-                if (!$child.HasExited) { $child.Kill(); $child.WaitForExit() }
+                Stop-WorkerChildren $child $startup $generationStop
                 $child.Dispose(); $child = $null
-                if (!$startup.HasExited) { $startup.Kill(); $startup.WaitForExit() }
                 $startup.Dispose(); $startup = $null
             } catch {
-                if ($child) { if (!$child.HasExited) { $child.Kill(); $child.WaitForExit() }; $child.Dispose(); $child = $null }
-                if ($startup) { if (!$startup.HasExited) { $startup.Kill(); $startup.WaitForExit() }; $startup.Dispose(); $startup = $null }
+                Stop-WorkerChildren $child $startup $generationStop
+                if ($child) { $child.Dispose(); $child = $null }
+                if ($startup) { $startup.Dispose(); $startup = $null }
                 Write-Json $script:StatePath @{ State = 'error'; Message = $_.Exception.Message; Version = $script:Version }
+            } finally {
+                if ($generationStop -and (Test-Path -LiteralPath $generationStop)) { Remove-Item -LiteralPath $generationStop -Force }
             }
+            if ($refresh) { continue }
             for ($i = 0; $i -lt 30 -and !(Test-Path -LiteralPath $script:StopPath); $i++) { Start-Sleep -Seconds 1 }
         }
     } finally {
-        if ($startup) { if (!$startup.HasExited) { $startup.Kill(); $startup.WaitForExit() }; $startup.Dispose() }
-        if ($child) { if (!$child.HasExited) { $child.Kill(); $child.WaitForExit() }; $child.Dispose() }
+        Stop-WorkerChildren $child $startup $generationStop
+        if ($startup) { $startup.Dispose() }
+        if ($child) { $child.Dispose() }
         if ($owned) { Write-Json $script:StatePath @{ State = 'stopped'; Version = $script:Version }; $mutex.ReleaseMutex() }
         $mutex.Dispose()
     }
@@ -375,8 +413,12 @@ function Restore-ShortcutState($Entries) {
 function Install-Badge($Overrides) {
     Assert-OwnedDirectory $script:InstallRoot
     Assert-ShortcutAvailable $script:StartupLink 'Run'
-    $config = Resolve-Configuration (Read-Json $script:ConfigPath) $Overrides
-    foreach ($name in @('agent.cjs','bridge.cjs','startup/controller.cjs','startup/windows.cjs')) {
+    $saved = Read-Json $script:ConfigPath
+    if ($AutomaticUpdate -and !$saved) { throw 'Automatic update requires an existing installation' }
+    if ($AutomaticUpdate -and !$ForceUpdate -and !(Get-AutoUpdateEnabled)) { throw 'Automatic updates were disabled before installation' }
+    if ($AutomaticUpdate -and $saved -and [version]($saved.Version -split '-')[0] -gt [version]$script:Version) { throw 'Automatic update cannot downgrade the installed version' }
+    $config = Resolve-Configuration $saved $Overrides
+    foreach ($name in @('agent.cjs','bridge.cjs','update.cjs','startup/controller.cjs','startup/windows.cjs')) {
         $file = Join-Path $PSScriptRoot $name
         if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "安装包不完整，请先解压 ZIP：$name" }
         [void](Invoke-Hidden $config.NodeExe @('--check',$file))
@@ -390,7 +432,7 @@ function Install-Badge($Overrides) {
     try {
         [void][IO.Directory]::CreateDirectory($stage)
         Write-Utf8 (Join-Path $stage '.codex-usage-badge-owner') $script:Owner
-        foreach ($name in @('manage-windows.ps1','agent.cjs','bridge.cjs','Install.cmd','Launch.cmd','Status.cmd','Uninstall.cmd','README-Windows.md')) {
+        foreach ($name in @('manage-windows.ps1','agent.cjs','bridge.cjs','update.cjs','update-windows.ps1','Install.cmd','Launch.cmd','Status.cmd','Uninstall.cmd','Update.cmd','README-Windows.md')) {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stage $name)
         }
         [void][IO.Directory]::CreateDirectory((Join-Path $stage 'startup'))
@@ -399,6 +441,11 @@ function Install-Badge($Overrides) {
         }
         Write-Json (Join-Path $stage 'config.json') $config
         Stop-Worker
+        foreach ($name in @('update-preferences.json','update-state.json')) {
+            $oldFile = Join-Path $script:InstallRoot $name
+            if (Test-Path -LiteralPath $oldFile) { Copy-Item -LiteralPath $oldFile -Destination (Join-Path $stage $name) }
+        }
+        if ($DisableAutoUpdate) { Write-Json (Join-Path $stage 'update-preferences.json') @{ Enabled = $false } }
         $oldReceipt = Join-Path $script:InstallRoot 'startup/state.json'
         if (Test-Path -LiteralPath $oldReceipt) { Copy-Item -LiteralPath $oldReceipt -Destination (Join-Path $stage 'startup/state.json') }
         if (Test-Path -LiteralPath $script:InstallRoot) { Move-Item -LiteralPath $script:InstallRoot -Destination $backup; $oldMoved = $true }
@@ -475,6 +522,9 @@ function Show-Status {
     Write-Host "Codex 用量条 Windows $script:Version"
     Write-Host "安装目录：$script:InstallRoot"
     Write-Host "后台运行：$(Test-Worker)"
+    Write-Host "自动更新：$(Get-AutoUpdateEnabled)（GitHub Windows Release，每 6 小时检查）"
+    $update = Read-Json (Join-Path $script:InstallRoot 'update-state.json')
+    if ($update) { Write-Host ('更新状态：' + ($update | ConvertTo-Json -Compress)) }
     $state = Read-Json $script:StatePath
     if ($state) { Write-Host ($state | ConvertTo-Json -Compress) }
     $receipt = Read-Json (Join-Path $script:InstallRoot 'startup/state.json')
@@ -487,15 +537,49 @@ function Show-Status {
     }
 }
 
+function Get-AutoUpdateEnabled {
+    $preference = Read-Json (Join-Path $script:InstallRoot 'update-preferences.json')
+    return (Get-Setting $preference 'Enabled') -ne $false
+}
+function Invoke-BadgeUpdate([bool]$Force) {
+    Assert-OwnedDirectory $script:InstallRoot
+    if (!$Force -and !(Get-AutoUpdateEnabled)) { return }
+    $config = Read-Json $script:ConfigPath
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $config.NodeExe
+    $arguments = @((Join-Path $script:InstallRoot 'update.cjs'))
+    if ($Force) { $arguments += '--force' }
+    $info.Arguments = Join-NativeArguments $arguments
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $info
+    try {
+        [void]$proc.Start()
+        $out = $proc.StandardOutput.ReadToEndAsync(); $err = $proc.StandardError.ReadToEndAsync()
+        # Do not interrupt the installer in the middle of its directory swap or rollback.
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw $err.Result.Trim() }
+        if ($Force) { Write-Host ((Read-Json (Join-Path $script:InstallRoot 'update-state.json')) | ConvertTo-Json -Compress) }
+    } finally { $proc.Dispose() }
+}
+
 if ($Action -eq 'Functions') { return }
 $operation = $null
 $operationOwned = $false
 try {
     Initialize-Context
     if ($Action -notin @('Run','Status')) {
-        $operation = New-Object Threading.Mutex($false, ($script:MutexName + '.manage'))
+        # This mutex survives crashes and stays held across an install directory swap.
+        $suffix = '.manage'
+        if ($Action -in @('Update','CheckUpdate')) { $suffix = '.update' }
+        $operation = New-Object Threading.Mutex($false, ($script:MutexName + $suffix))
         try { $operationOwned = $operation.WaitOne(0) } catch [Threading.AbandonedMutexException] { $operationOwned = $true }
-        if (!$operationOwned) { throw '另一个安装、启动或卸载操作正在进行，请稍后重试。' }
+        if (!$operationOwned) {
+            if ($Action -eq 'CheckUpdate') { return }
+            throw '另一个安装或更新操作正在进行，请稍后重试。'
+        }
     }
     switch ($Action) {
         'Install' { Install-Badge ([pscustomobject]@{ AppExe=$AppExe; NodeExe=$NodeExe; CodexBin=$CodexBin; CodexHome=$CodexHome }) }
@@ -503,6 +587,10 @@ try {
         'Run' { Run-Worker }
         'Uninstall' { Uninstall-Badge }
         'Status' { Show-Status }
+        'Update' { Invoke-BadgeUpdate $true }
+        'CheckUpdate' { Invoke-BadgeUpdate $false }
+        'UpdatesOn' { Assert-OwnedDirectory $script:InstallRoot; Write-Json (Join-Path $script:InstallRoot 'update-preferences.json') @{ Enabled=$true }; Write-Host '自动更新已开启。' }
+        'UpdatesOff' { Assert-OwnedDirectory $script:InstallRoot; Write-Json (Join-Path $script:InstallRoot 'update-preferences.json') @{ Enabled=$false }; Write-Host '自动更新已关闭。' }
     }
 } catch {
     if ($Action -eq 'Launch') {

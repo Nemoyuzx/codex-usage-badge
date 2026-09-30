@@ -54,6 +54,19 @@ try {
     Assert ($manifestPaths.Count -eq 1 -and $manifestPaths[0] -match 'app[/\\]Codex.exe$') 'Store manifest executable'
     $config = Resolve-Configuration ([pscustomobject]@{AppExe='stale';NodeExe='stale';CodexBin='stale'}) $null
     Assert ($config.AppExe -eq $gui -and $config.NodeExe -eq $node -and $config.CodexBin -eq $cli) 'Store runtime discovery and invalid runtime fallback'
+    Assert (Test-ConfigurationCurrent $config) 'unchanged app is current'
+    $nextGui=Join-Path $temp 'Updated/ChatGPT.exe'
+    [void][IO.Directory]::CreateDirectory((Join-Path (Split-Path $nextGui) 'resources'))
+    Write-Utf8 $nextGui 'fixture';Write-Utf8 (Join-Path (Split-Path $nextGui) 'resources/app.asar') 'fixture'
+    $script:candidateGui=$nextGui
+    function Get-AppCandidates($Saved) { $script:candidateGui; Get-Setting $Saved 'AppExe' }
+    Assert (!(Test-ConfigurationCurrent $config)) 'new app must be detected even while old package exists'
+    $pinned=Resolve-Configuration $config ([pscustomobject]@{AppExe=$gui})
+    Assert (Test-ConfigurationCurrent $pinned) 'explicit application path stays pinned'
+    $script:candidateGui=$gui
+    Remove-Item -LiteralPath $node
+    Assert (!(Test-ConfigurationCurrent $config)) 'removed runtime requires rediscovery'
+    Write-Utf8 $node 'fixture'
     $explicitHome = Join-Path $temp '自定义 Codex 数据'
     $custom = Resolve-Configuration $config ([pscustomobject]@{CodexHome=$explicitHome;NodeExe=$node})
     Assert ($custom.CodexHome -eq $explicitHome -and $custom.Overrides.NodeExe -eq $node) 'custom paths persisted'
@@ -111,6 +124,8 @@ try {
     Write-Utf8 $script:DesktopLink (Get-ManagerArguments 'Launch')
     Write-Json (Join-Path $script:InstallRoot 'startup/state.json') @{lastAttemptAt=123;event='attempt'}
     $firstConfig = Get-Content -LiteralPath $script:ConfigPath -Raw
+    Write-Json (Join-Path $script:InstallRoot 'update-preferences.json') @{Enabled=$false}
+    Write-Json (Join-Path $script:InstallRoot 'update-state.json') @{event='up-to-date';checkedAt=123}
     Write-Utf8 (Join-Path $script:InstallRoot 'old-version.txt') 'old fixture'
     $script:failStart = $true
     Throws { Install-Badge $null } 'injected startup failure'
@@ -121,12 +136,23 @@ try {
     Assert (!(Test-Path -LiteralPath (Join-Path $script:InstallRoot 'old-version.txt'))) 'successful upgrade uses new package'
     Assert (!(Test-Path -LiteralPath $script:DesktopLink)) 'owned legacy shortcut removed'
     Assert ((Read-Json (Join-Path $script:InstallRoot 'startup/state.json')).lastAttemptAt -eq 123) 'cooldown receipt retained during upgrade'
+    Assert (!(Get-AutoUpdateEnabled)) 'disabled auto update preference survives upgrade'
+    Assert ((Read-Json (Join-Path $script:InstallRoot 'update-state.json')).checkedAt -eq 123) 'update interval survives upgrade'
+    $AutomaticUpdate=$true
+    Throws { Install-Badge $null } 'disabled'
+    $ForceUpdate=$true
+    $future=Read-Json $script:ConfigPath;$future.Version='99.0.0';Write-Json $script:ConfigPath $future
+    Throws { Install-Badge $null } 'downgrade'
+    $AutomaticUpdate=$false;$ForceUpdate=$false
     Write-Utf8 (Join-Path $temp 'unrelated-data.txt') 'keep'
     Uninstall-Badge
     Assert (!$script:running -and !(Test-Path -LiteralPath $script:InstallRoot)) 'uninstall stopped worker and archived install'
     Assert (!(Test-Path -LiteralPath $script:DesktopLink) -and !(Test-Path -LiteralPath $script:StartupLink)) 'owned shortcuts removed'
     Assert ((Get-Content -LiteralPath (Join-Path $temp 'unrelated-data.txt')) -eq 'keep') 'uninstall preserves unrelated files'
     Uninstall-Badge
+    $AutomaticUpdate=$true
+    Throws { Install-Badge $null } 'existing installation'
+    $AutomaticUpdate=$false
     Write-Host 'PASS first-install rollback, retry, upgrade rollback, backup, ownership conflicts, uninstall and repeat uninstall (Windows OS calls mocked)'
 } finally {
     $env:LOCALAPPDATA = $oldLocal; $env:USERPROFILE = $oldHome; $env:CODEX_HOME = $oldCodexHome

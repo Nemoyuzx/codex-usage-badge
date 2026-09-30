@@ -71,7 +71,7 @@ async function main() {
     launch:async(stamp,foreground)=>await portInUse()?{launched:false}:bridge.call('launch',{stamp,foreground}),
     show:(app,stamp,foreground)=>bridge.call('show',{pid:app.pid,key:app.key,stamp,foreground}),
     async record(event,details={}) {
-      const {message,reason,ageMs,inputIdleMs,frontmostPid,...previous}=state;
+      const {message,reason,errorCode,processCount,rebootReason,shown,ageMs,inputIdleMs,frontmostPid,...previous}=state;
       state={...previous,...details,event,nativePid:bridge.child.pid,updatedAt:Date.now()};
       writeReceipt(receipt,state);
       console.log(new Date().toISOString(),event);
