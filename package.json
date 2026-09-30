@@ -1,15 +1,19 @@
 {
   "name": "codex-usage-badge",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "windowsVersion": "0.10.0",
   "private": true,
-  "description": "Local desktop quota rings, project colors and Token indicators for Codex",
+  "description": "Local desktop quota rings, project colors, folder sizes and Token indicators for Codex",
   "license": "MIT",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "python3 build.py",
     "test": "node tests/run.cjs",
     "test:privacy": "python3 scripts/audit_release.py"
   },
-  "devDependencies": { "playwright": "1.63.0" }
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
 }

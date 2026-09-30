@@ -148,7 +148,7 @@ async function install() {
   }
   try {await cleanupLegacyLauncher({home,app,installDir,bridge:path.join(startupDir,'bridge'),command,ownedLauncher,ownedShortcut});}
   catch(error){console.warn('自动加载已安装；旧快捷方式需手动移除：'+error.message);}
-  console.log('已安装 v0.9.2。完全退出客户端后，从原来的 Codex 图标打开，等待 5–10 秒。');
+  console.log('已安装 v0.9.3。完全退出客户端后，从原来的 Codex 图标打开，等待 5–10 秒。');
 }
 async function targets() {
   const response=await fetch('http://127.0.0.1:39222/json/list',{signal:AbortSignal.timeout(2000)});
@@ -178,7 +178,7 @@ function appRunning() {
   return command('/bin/ps',['-Ao','comm=']).split('\n').some(s=>s.trim()===path.join(app,'Contents/MacOS',executable));
 }
 function record(value) {
-  fs.writeFileSync(path.join(installDir,'状态.json'),JSON.stringify({time:new Date().toISOString(),version:'0.9.2',...value},null,2)+'\n');
+  fs.writeFileSync(path.join(installDir,'状态.json'),JSON.stringify({time:new Date().toISOString(),version:'0.9.3',...value},null,2)+'\n');
 }
 async function waitForExit({isRunning=appRunning,sleep=pause,now=Date.now,timeoutMs=300000}={}) {
   const deadline=now()+timeoutMs;
@@ -220,8 +220,8 @@ async function activate({allowRestart=false,foreground=false}={}) {
   for(let attempt=0;attempt<45;attempt++) {
     try {
       const pages=await targets();
-      const results=await Promise.all(pages.map(async t=>({target:t,status:await evaluate(t,'window.__codexUsageBadge?.status() ?? null'),colors:await evaluate(t,'window.__codexProjectColors?.status() ?? null'),tokens:await evaluate(t,'window.__codexThreadTokens?.status() ?? null')})));
-      const shown=results.filter(r=>r.status?.placed&&r.status.badgeCount===1&&r.status.version===46&&!r.status.stale&&Number.isFinite(r.status.updatedAt)&&Date.now()-r.status.updatedAt<150000&&r.colors?.version===2&&r.tokens?.version===7);
+      const results=await Promise.all(pages.map(async t=>({target:t,status:await evaluate(t,'window.__codexUsageBadge?.status() ?? null'),colors:await evaluate(t,'window.__codexProjectColors?.status() ?? null'),tokens:await evaluate(t,'window.__codexThreadTokens?.status() ?? null'),sizes:await evaluate(t,'window.__codexProjectSizes?.status() ?? null')})));
+      const shown=results.filter(r=>r.status?.placed&&r.status.badgeCount===1&&r.status.version===46&&!r.status.stale&&Number.isFinite(r.status.updatedAt)&&Date.now()-r.status.updatedAt<150000&&r.colors?.version===2&&r.tokens?.version===7&&r.sizes?.version===2);
       if(shown.length&&/state = running/.test(loaded(label)||'')) {
         uiWasShown=true;
         const target=shown[0].target;
@@ -233,7 +233,7 @@ async function activate({allowRestart=false,foreground=false}={}) {
           continue;
         }
         const {version:uiVersion,...uiStatus}=current;
-        record({state:'ready',message:'侧栏额度、文件夹颜色和会话 Token 显示已启用',windows:shown.length,uiVersion,...uiStatus,projectColors:shown[0].colors,threadTokens:shown[0].tokens});
+        record({state:'ready',message:'侧栏额度、文件夹颜色、容量和会话 Token 显示已启用',windows:shown.length,uiVersion,...uiStatus,projectColors:shown[0].colors,threadTokens:shown[0].tokens,projectSizes:shown[0].sizes});
         console.log(`安装成功：侧栏进度条已显示，${readings.map(r=>`${r.label} ${Number.isFinite(r.percent)?`剩余 ${r.percent}%`:'暂不可用'}`).join('，')}。`);
         return;
       }
@@ -252,7 +252,7 @@ async function scheduleActivation(options={}) {
 }
 async function cleanupUi() {
   let pages=[];try{pages=await targets();}catch{return;}
-  const results=await Promise.allSettled(pages.map(page=>evaluate(page,'(() => {window.__codexUsageBadge?.destroy?.();window.__codexProjectColors?.destroy?.({clearStorage:true});window.__codexThreadTokens?.destroy?.();return !document.getElementById("codex-usage-badge")&&!document.getElementById("codex-project-colors-style")&&!document.getElementById("codex-thread-tokens-style");})()')));
+  const results=await Promise.allSettled(pages.map(page=>evaluate(page,'(() => {window.__codexUsageBadge?.destroy?.();window.__codexProjectColors?.destroy?.({clearStorage:true});window.__codexThreadTokens?.destroy?.();window.__codexProjectSizes?.destroy?.();return !document.getElementById("codex-usage-badge")&&!document.getElementById("codex-project-colors-style")&&!document.getElementById("codex-thread-tokens-style")&&!document.getElementById("codex-project-sizes-style");})()')));
   if(results.some(r=>r.status==='rejected'||r.value!==true))console.warn('部分窗口暂不可连接；后台仍会卸载，残留界面将在下次打开客户端时消失。');
 }
 async function uninstall() {
@@ -268,12 +268,12 @@ async function uninstall() {
   console.log('已卸载并清除界面，无需重启。文件已移入废纸篓。');
 }
 async function status() {
-  console.log('版本：0.9.2');
+  console.log('版本：0.9.3');
   console.log('自动加载：'+(/state = running/.test(loaded(startupLabel)||'')?'运行中':'未运行'));
   console.log('后台：'+(/state = running/.test(loaded(label)||'')?'运行中':'未运行'));
   let pages=[];try{pages=await targets();}catch{}
   console.log('主窗口连接数：'+pages.length);
-  for(let i=0;i<pages.length;i++)console.log('窗口 '+(i+1),await evaluate(pages[i],'({usage:window.__codexUsageBadge?.status()??null,projectColors:window.__codexProjectColors?.status()??null,threadTokens:window.__codexThreadTokens?.status()??null})'));
+  for(let i=0;i<pages.length;i++)console.log('窗口 '+(i+1),await evaluate(pages[i],'({usage:window.__codexUsageBadge?.status()??null,projectColors:window.__codexProjectColors?.status()??null,threadTokens:window.__codexThreadTokens?.status()??null,projectSizes:window.__codexProjectSizes?.status()??null})'));
   const receipt=path.join(installDir,'状态.json');if(fs.existsSync(receipt))console.log('上次安装验证记录（历史数据，以以上实时读数为准）：\n'+fs.readFileSync(receipt,'utf8'));
 }
 module.exports={startupConfig,agentConfig,activationConfig,waitForExit,xml,install,uninstall,preflight};

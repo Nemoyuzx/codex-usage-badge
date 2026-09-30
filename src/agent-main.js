@@ -1,4 +1,4 @@
-var AGENT_VERSION = '0.9.2';
+var AGENT_VERSION = '0.9.3';
 function parseArgs(argv) {
   const options = {
     port: Number(process.env.CODEX_BADGE_PORT) || 39222,
@@ -25,12 +25,14 @@ async function main() {
   log(`codex-usage-badge v${AGENT_VERSION} 启动：仅连接本机端口 ${options.port}，不启动、不退出、不激活客户端。`);
   const injector = new RendererInjector({ port: options.port, debug: options.debug, scanIntervalMs: 5000 });
   const tokenReader = new ThreadTokenReader();
+  const projectSizeScanner = new ProjectSizeScanner();
   let stopped = false;
   let client = null;
   let pending = false;
   let nextRead = 0;
   let failures = 0;
   let connected = false;
+  let refreshingProjectSizes = false;
   injector.currentValue = { percent: null, title: '正在读取 Codex 剩余用量', tone: 'muted', windowLabel: '' };
   // A missing port is an idle state, never a reason to restart or focus the app.
   const scan = async () => {
@@ -91,11 +93,19 @@ async function main() {
       await injector.update(unavailableValue(injector.currentValue));
     } finally { pending = false; }
   }
+  const updateProjectSizes = async () => {
+    if (stopped || refreshingProjectSizes || injector.sessions.size === 0) return;
+    refreshingProjectSizes = true;
+    try { await refreshProjectSizes(injector, projectSizeScanner); }
+    finally { refreshingProjectSizes = false; }
+  };
+  projectSizeScanner.onChange = () => { updateProjectSizes().catch(() => {}); };
   const tick = async () => {
     await scan();
     // Quota requests can wait on the network; pending prevents overlap without delaying local reads.
     readUsage().catch(error => { if (!stopped) log(`额度刷新暂不可用：${error.message}`); });
     await refreshThreadTokens(injector, tokenReader);
+    await updateProjectSizes();
   };
   let ticking = false;
   const guardedTick = async () => {
@@ -111,6 +121,7 @@ async function main() {
     clearInterval(timer);
     if (stopTimer) clearInterval(stopTimer);
     const old = client; client = null; old?.stop();
+    projectSizeScanner.stop();
     injector.stop();
     process.exit(0);
   };
@@ -124,5 +135,7 @@ async function main() {
   }
   await guardedTick();
 }
-module.exports = { installUsageBadge, installProjectColors, installThreadTokens, ThreadTokenReader, refreshThreadTokens, buildBootstrapScript, formatRateLimits, mergeRateLimitsResponse, isMainWindow, resolveCodexBin, AppServerClient, main };
+module.exports = { installUsageBadge, installProjectColors, installProjectSizes, installThreadTokens, ThreadTokenReader, refreshThreadTokens,
+  ProjectSizeScanner, measureDirectory, measureDirectoryPortable, measureProjectRoots, refreshProjectSizes,
+  buildBootstrapScript, formatRateLimits, mergeRateLimitsResponse, isMainWindow, resolveCodexBin, AppServerClient, main };
 if (require.main === module) main().catch(error => { log(`agent 启动失败：${error.message}`); process.exitCode = 1; });
