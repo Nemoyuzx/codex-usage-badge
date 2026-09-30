@@ -1,6 +1,6 @@
 {
   "name": "codex-usage-badge",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "windowsVersion": "0.10.1",
   "private": true,
   "description": "Local desktop quota rings, project colors, folder sizes and Token indicators for Codex",
