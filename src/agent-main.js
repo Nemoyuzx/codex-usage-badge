@@ -1,4 +1,4 @@
-var AGENT_VERSION = '0.9.3';
+var AGENT_VERSION = '0.9.4';
 function parseArgs(argv) {
   const options = {
     port: Number(process.env.CODEX_BADGE_PORT) || 39222,
