@@ -109,6 +109,8 @@ namespace CodexUsageBadge.Startup {
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
         [DllImport("shell32.dll", CharSet=CharSet.Unicode)] static extern IntPtr CommandLineToArgvW(string text, out int count);
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+        [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+        static extern bool QueryFullProcessImageName(IntPtr process,uint flags,StringBuilder value,ref uint length);
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern int GetApplicationUserModelId(IntPtr process,ref uint length,StringBuilder value);
         [ComImport,Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")] class ActivationManager {}
         [ComImport,Guid("2E941141-7F97-4756-BA1D-9DECDE894A3D"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -145,8 +147,16 @@ namespace CodexUsageBadge.Startup {
             if(result!=0) throw new System.ComponentModel.Win32Exception(result,"Cannot resolve desktop activation identity");
             return value.ToString();
         }
+        static string ReadImagePath(Process p) {
+            var value=new StringBuilder(32768); uint length=(uint)value.Capacity;
+            if(!QueryFullProcessImageName(p.Handle,0,value,ref length))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Cannot resolve desktop executable identity");
+            return value.ToString();
+        }
         static bool Matches(Process p) {
-            return !p.HasExited && p.SessionId==sessionId && String.Equals(p.MainModule.FileName,appPath,StringComparison.OrdinalIgnoreCase);
+            // The main module list can still contain the loader when Process.Start
+            // returns. Query the process image directly without waiting for modules.
+            return !p.HasExited && p.SessionId==sessionId && String.Equals(ReadImagePath(p),appPath,StringComparison.OrdinalIgnoreCase);
         }
         static string[] ReadArguments(Process p) {
             string key=Identity(p); string[] cached;
@@ -249,7 +259,9 @@ namespace CodexUsageBadge.Startup {
             var s=TakeSnapshot();
             if(Stopped()||s.apps.Length!=0||s.inputStamp!=stamp||stamp=="unknown"||s.frontmostPid!=foreground) return new {launched=false};
             using(var p=StartApplication()) {
-                if(!Matches(p)) throw new InvalidOperationException("Activated desktop process identity did not match");
+                p.Refresh();
+                if(p.HasExited) throw new InvalidOperationException("Activated desktop process exited: "+p.ExitCode);
+                if(!Matches(p)) throw new InvalidOperationException("Activated desktop process identity did not match: "+ReadImagePath(p)+", session "+p.SessionId);
                 return new {launched=true,pid=p.Id,key=Identity(p)};
             }
         }
