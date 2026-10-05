@@ -1,4 +1,21 @@
 var AGENT_VERSION = '0.9.4';
+async function refreshThreadMetrics(injector, reader) {
+  const sessions = [...injector.sessions.values()];
+  if (!sessions.length) return;
+  const requests = await Promise.all(sessions.map(async session => {
+    try {
+      const result = await session.evaluate('window.__codexThreadMetrics?.requestedIds() ?? []');
+      const ids = result?.result?.value;
+      return { session, ids: Array.isArray(ids) ? ids.filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)).slice(0, 4) : [] };
+    } catch { return { session, ids: [] }; }
+  }));
+  const snapshot = await reader.read(requests.flatMap(request => request.ids));
+  await Promise.all(requests.map(async ({ session, ids }) => {
+    // Send aggregate numbers only, and only to the window that requested this thread.
+    const perThread = Object.fromEntries(ids.filter(id => Object.hasOwn(snapshot.perThread, id)).map(id => [id, snapshot.perThread[id]]));
+    try { await session.evaluate(`window.__codexThreadMetrics?.update(${JSON.stringify({ ...snapshot, perThread })})`); } catch {}
+  }));
+}
 function parseArgs(argv) {
   const options = {
     port: Number(process.env.CODEX_BADGE_PORT) || 39222,
@@ -25,6 +42,7 @@ async function main() {
   log(`codex-usage-badge v${AGENT_VERSION} 启动：仅连接本机端口 ${options.port}，不启动、不退出、不激活客户端。`);
   const injector = new RendererInjector({ port: options.port, debug: options.debug, scanIntervalMs: 5000 });
   const tokenReader = new ThreadTokenReader();
+  const metricsReader = new ThreadMetricsReader();
   const projectSizeScanner = new ProjectSizeScanner();
   let stopped = false;
   let client = null;
@@ -105,6 +123,7 @@ async function main() {
     // Quota requests can wait on the network; pending prevents overlap without delaying local reads.
     readUsage().catch(error => { if (!stopped) log(`额度刷新暂不可用：${error.message}`); });
     await refreshThreadTokens(injector, tokenReader);
+    await refreshThreadMetrics(injector, metricsReader);
     await updateProjectSizes();
   };
   let ticking = false;
@@ -122,6 +141,7 @@ async function main() {
     if (stopTimer) clearInterval(stopTimer);
     const old = client; client = null; old?.stop();
     projectSizeScanner.stop();
+    metricsReader.stop?.();
     injector.stop();
     process.exit(0);
   };
@@ -136,6 +156,7 @@ async function main() {
   await guardedTick();
 }
 module.exports = { installUsageBadge, installProjectColors, installProjectSizes, installThreadTokens, ThreadTokenReader, refreshThreadTokens,
+  installThreadMetrics, ThreadMetricsReader, refreshThreadMetrics,
   ProjectSizeScanner, measureDirectory, measureDirectoryPortable, measureProjectRoots, refreshProjectSizes,
   buildBootstrapScript, formatRateLimits, mergeRateLimitsResponse, isMainWindow, resolveCodexBin, AppServerClient, main };
 if (require.main === module) main().catch(error => { log(`agent 启动失败：${error.message}`); process.exitCode = 1; });

@@ -5,7 +5,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 const startup = deferred(), refresh = deferred();
-let now = 0, tokenReads = 0, sizeReads = 0, scans = 0, starts = 0, refreshes = 0, interval, injector;
+let now = 0, tokenReads = 0, metricsReads = 0, sizeReads = 0, scans = 0, starts = 0, refreshes = 0, interval, injector;
 const hooks = {};
 class FakeInjector {
   constructor() { injector = this; this.sessions = new Map([['local', {}]]); }
@@ -25,11 +25,13 @@ const sandbox = {
   Date: { now: () => now },
   setInterval: fn => { interval = fn; return 1; }, clearInterval: noop,
   RendererInjector: FakeInjector, AppServerClient: FakeClient, ThreadTokenReader: class {},
+  ThreadMetricsReader: class { async read() { metricsReads++; return { ok: true, perThread: {}, checkedAt: now }; } },
   ProjectSizeScanner: class { stop() {} }, refreshProjectSizes: async () => {sizeReads++;},
   measureDirectory: noop, measureDirectoryPortable: noop, measureProjectRoots: noop,
   refreshThreadTokens: async () => { tokenReads++; }, resolveCodexBin: () => 'fake',
   unavailableValue: current => ({ ...current, stale: true }),
   installUsageBadge: noop, installProjectColors: noop, installProjectSizes: noop, installThreadTokens: noop,
+  installThreadMetrics: noop,
   buildBootstrapScript: noop, formatRateLimits: noop, mergeRateLimitsResponse: noop, isMainWindow: noop
 };
 // log() constructs Date; expose both a real constructor and the controlled now().
@@ -49,6 +51,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
     assert.equal(refreshes, 1);
     now = 70000; await interval(); await flush();
     assert.equal(tokenReads, 4, 'slow quota refresh must not block subsequent local reads');
+    assert.equal(metricsReads, 4, 'slow quota refresh must not block current thread metric reads');
     assert.equal(refreshes, 1);
     assert.equal(scans, 4);
     assert.equal(sizeReads, 4, 'slow quota refresh must not block folder size updates');

@@ -34,7 +34,7 @@ for target_platform in platforms:
         mapping.update({'manage.cjs':'manage.cjs','scripts/mac-entry.sh':'scripts/mac-entry.sh','macos/shortcuts.cjs':'macos/shortcuts.cjs','macos/startup/bridge':'.devtools/macos-startup-bridge','macos/startup/controller.cjs':'macos/startup/controller.cjs','macos/startup/watch.cjs':'macos/startup/watch.cjs'})
         for filename in ['core.cjs', 'worker.cjs', 'run.sh']:
             mapping['updater/'+filename] = 'updater/'+filename
-        generated['update.json'] = (json.dumps({'schema':1,'repository':'jaykinhoo9/codex-usage-badge','platform':'macOS','version':version},sort_keys=True)+'\n').encode()
+        generated['update.json'] = (json.dumps({'schema':1,'repository':'Nemoyuzx/codex-usage-badge','platform':'macOS','version':version},sort_keys=True)+'\n').encode()
         modes['updater/run.sh'] = 0o755
         modes['scripts/mac-entry.sh'] = 0o755
         modes['macos/startup/bridge'] = 0o755

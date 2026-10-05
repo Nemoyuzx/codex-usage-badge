@@ -3,7 +3,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const zlib=require('node:zlib');
-const repository='jaykinhoo9/codex-usage-badge';
+const repository='Nemoyuzx/codex-usage-badge';
 const intervalMs=6*60*60*1000;
 const maxArchive=16*1024*1024,maxExpanded=48*1024*1024;
 const required=['agent.cjs','manage.cjs','macos/shortcuts.cjs','macos/startup/bridge','macos/startup/controller.cjs','macos/startup/watch.cjs','updater/core.cjs','updater/worker.cjs','updater/run.sh','update.json'];

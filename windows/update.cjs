@@ -3,7 +3,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {spawn}=require('node:child_process');
-const REPO='jaykinhoo9/codex-usage-badge';
+const REPO='Nemoyuzx/codex-usage-badge';
 const INTERVAL=6*60*60*1000;
 const MAX_ARCHIVE=20*1024*1024;
 function compareVersions(a,b) {

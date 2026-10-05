@@ -164,7 +164,7 @@ async function installUnlocked() {
     if(!ready)throw new Error('启动助手未能就绪');
     const settingsFile=path.join(installDir,'update-settings.json');
     if(!fs.existsSync(settingsFile))fs.writeFileSync(settingsFile,JSON.stringify({owner:'codex-usage-badge-updater-v1',enabled:true,allowPrerelease:true})+'\n',{mode:0o600});
-    fs.writeFileSync(path.join(installDir,'installed-version.json'),JSON.stringify({schema:1,platform:'macOS',repository:'jaykinhoo9/codex-usage-badge',version:VERSION,app:fs.realpathSync(app),codexHome:process.env.CODEX_HOME||''})+'\n',{mode:0o600});
+    fs.writeFileSync(path.join(installDir,'installed-version.json'),JSON.stringify({schema:1,platform:'macOS',repository:'Nemoyuzx/codex-usage-badge',version:VERSION,app:fs.realpathSync(app),codexHome:process.env.CODEX_HOME||''})+'\n',{mode:0o600});
     // Keep an already loaded updater alive: it may be waiting for this child installer.
     if(!existingUpdater){command('/bin/launchctl',['bootstrap',gui,updaterPlist]);startedUpdater=true;}
     record({state:'installed',message:'自动加载已启用，下次从原客户端图标启动即可'});
