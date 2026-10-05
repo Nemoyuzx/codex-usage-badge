@@ -34,11 +34,12 @@ const session = requested => ({
   await refreshThreadMetrics(injector, { read() { throw Error('must not read without a window'); } });
   const actorA = 'a'.repeat(64), actorB = 'b'.repeat(64), local = 'c'.repeat(64), revision = 'd'.repeat(64);
   const savedA = { threadId: ids[0], actorScopeId: actorA, scopeId: local, pendingVersion: 4, producerId: '00000000-0000-0000-0000-000000000010', fields: {} };
-  const contextSession = context => ({ updates: [], acks: [], async evaluate(expression) {
+  const contextSession = context => ({ updates: [], acks: [], archiveAcks: [], async evaluate(expression) {
     if (expression.includes('requestedIds()')) return { result: { value: context } };
-    const prefix = expression.startsWith('window.__codexThreadMetrics?.ackPersisted(') ? 'window.__codexThreadMetrics?.ackPersisted(' : 'window.__codexThreadMetrics?.update(';
+    const prefix = expression.startsWith('window.__codexThreadMetrics?.ackArchives(') ? 'window.__codexThreadMetrics?.ackArchives(' :
+      expression.startsWith('window.__codexThreadMetrics?.ackPersisted(') ? 'window.__codexThreadMetrics?.ackPersisted(' : 'window.__codexThreadMetrics?.update(';
     const value = JSON.parse(expression.slice(prefix.length, -1));
-    (prefix.includes('ackPersisted') ? this.acks : this.updates).push(value);
+    (prefix.includes('ackArchives') ? this.archiveAcks : prefix.includes('ackPersisted') ? this.acks : this.updates).push(value);
   } });
   const third = '00000000-0000-0000-0000-000000000003';
   const a = contextSession({ ids: [ids[0], third], actorScopeId: actorA, pending: [savedA] });
@@ -59,5 +60,38 @@ const session = requested => ({
   await refreshThreadMetrics({ sessions: new Map([['a', a]]) }, { async read() { return { ok: false, perThread: {}, checkedAt: 126 }; } }, { write() { return []; }, read() { throw Error('unverified data must not restore'); } });
   assert.equal(a.acks.length, 1, 'failed/uncommitted writes remain pending without false acknowledgements');
   assert.deepEqual(a.updates[1].persistedPerThread, {});
+  const archivedA = contextSession({ ids: [ids[0]], actorScopeId: actorA, pending: [savedA] });
+  const removed = [], archiveWrites = [];
+  const archiveStore = {
+    threadIds() { return [ids[0], ids[1]]; },
+    removeThreads(list) { removed.push(list); return list; },
+    write(records) { archiveWrites.push(records); return []; },
+    purgeCutoffs() { return { [ids[0]]: Date.now() }; },
+    read() { throw Error('archived threads cannot restore'); }
+  };
+  await refreshThreadMetrics({ sessions: new Map([['a', archivedA]]) }, {
+    archivedIds(candidates) { assert.ok(candidates.includes(ids[1]), 'startup must reconcile stored offscreen threads too'); return { ok: true, ids: [ids[0]] }; },
+    async read() { return { ok: true, perThread: { [ids[0]]: { archived: true, localVerified: true, scopeId: local } }, checkedAt: Date.now() }; }
+  }, archiveStore);
+  assert.ok(removed.some(list => list.includes(ids[0])));
+  assert.deepEqual(archiveWrites, [[]], 'a saved archived thread and its pending write must not resurrect');
+  assert.deepEqual(archivedA.updates[0].archivedIds, [ids[0]]);
+  assert.deepEqual(archivedA.updates[0].persistedPerThread, {});
+  const archivedAt = Date.now();
+  const undo = contextSession({ ids: [ids[0]], actorScopeId: actorA, pending: [savedA], archives: [{ threadId: ids[0], archivedAt }] });
+  const undoOrder = [];
+  let undoPurged = false;
+  await refreshThreadMetrics({ sessions: new Map([['undo', undo]]) }, {
+    archivedIds() { return { ok: true, ids: [] }; },
+    async read() { return { ok: true, perThread: {}, checkedAt: Date.now() }; }
+  }, {
+    threadIds() { return [ids[0]]; },
+    removeThreads(list, options) { undoOrder.push('purge'); undoPurged = true; assert.equal(options.cutoffAt, archivedAt, 'Undo uses the captured archive boundary, not the later poll time'); return list; },
+    write(records) { undoOrder.push('write'); assert.deepEqual(records, [savedA]); return []; },
+    purgeCutoffs() { return undoPurged ? { [ids[0]]: archivedAt } : {}; }
+  });
+  assert.deepEqual(undoOrder, ['purge', 'write'], 'rapid Undo still applies the native deletion before the store fences old in-flight fields');
+  assert.deepEqual(undo.archiveAcks[0], [{ threadId: ids[0], archivedAt }]);
+  assert.deepEqual(undo.updates[0].archivedIds, [], 'a processed past archive must not reblock a currently unarchived thread');
   console.log('PASS async metric refresh: per-window fairness and data isolation, durable nonce/version acknowledgements, scoped restores, offline windows and failed-write retry');
 })().catch(error => { console.error(error); process.exitCode = 1; });

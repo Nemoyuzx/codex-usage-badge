@@ -128,5 +128,80 @@ try {
   assert.deepEqual(store.write([record(ids[0], { rounds: entry(2) }, { revision: 'e'.repeat(64) })]), [], 'busy transactions never send a false acknowledgement');
   lock.exec('ROLLBACK'); lock.close();
   assert.equal(store.read(key(ids[0])).fields.rounds.value, 1);
+  assert.equal(store.threadIds().length, 150, 'startup reconciliation enumerates all saved conversations across cache namespaces');
+  const archiveLock = new DatabaseSync(file); archiveLock.exec('BEGIN IMMEDIATE');
+  assert.deepEqual(store.removeThreads([ids[0]]), [], 'a failed deletion transaction is never acknowledged');
+  archiveLock.exec('ROLLBACK'); archiveLock.close();
+  assert.equal(store.read(key(ids[0])).fields.rounds.value, 1);
+  assert.deepEqual(store.removeThreads([ids[0], ids[0], "');DELETE FROM threads;--"]), [ids[0]]);
+  assert.equal(store.read(key(ids[0])), null);
+  assert.equal(store.read(key(ids[0], { actorScopeId: 'f'.repeat(64) })), null);
+  assert.equal(store.read(key(ids[0], { scopeId: 'f'.repeat(64) })), null, 'all plugin-only namespaces for one archived UUID are removed');
+  assert.equal(store.threadIds().length, 149);
+  assert.equal(store.read(key(ids[1])).fields.rounds.value, 1, 'archive cleanup must not affect another conversation');
+  const inspector = new DatabaseSync(file, { readOnly: true });
+  assert.equal(inspector.prepare('SELECT COUNT(*) AS count FROM thread_metric_values WHERE thread_id=?').get(ids[0]).count, 0,
+    'archive removal cascades through the plugin numeric field rows');
+  inspector.close();
+  at = 14000;
+  assert.equal(store.write([record(ids[0], { rounds: entry(1) }, { revision: 'e'.repeat(64), pendingVersion: 10 })]).length, 1,
+    'unarchive may collect fresh metrics without resurrecting previously deleted fields');
+  assert.equal(store.read(key(ids[0])).fields.steps, undefined);
+  assert.equal(store.read(key(ids[0])).fields.rounds.value, 1);
+  const cutoff = store.purgeCutoffs([ids[0]])[ids[0]];
+  assert.equal(cutoff, 13000);
+  const oldPending = record(ids[0], { rounds: entry(9, 12000), llmDurationMs: entry(4000, 12000),
+    tokensPerSecond: entry(35, 12000, { source: 'monitor', approximate: true }) },
+    { updatedAt: 12000, revision: 'e'.repeat(64), pendingVersion: 99, producerId: '20000000-0000-0000-0000-000000000001' });
+  // Clear again and close/reopen to model archive -> rapid Undo before an old
+  // renderer's captured DTO eventually reaches the Node store.
+  at = 15000;
+  assert.deepEqual(store.removeThreads([ids[0]]), [ids[0]]);
+  assert.equal(store.purgeCutoffs([ids[0]])[ids[0]], 15000, 'a new archive with freshly collected numeric rows advances its fence');
+  store.stop(); store = new ThreadMetricsStore({ file, now: () => at });
+  assert.deepEqual(store.write([oldPending]), [{ actorScopeId, scopeId, threadId: ids[0], pendingVersion: 99,
+    producerId: oldPending.producerId }], 'old archived DTOs are acknowledged as handled so the outbox drains');
+  assert.equal(store.read(key(ids[0])), null, 'Undo never authorizes restoring fields captured before the durable purge cutoff');
+  assert.equal(store.threadIds().includes(ids[0]), false);
+  at = 16000;
+  assert.deepEqual(store.removeThreads([ids[0]]), [ids[0]]);
+  assert.equal(store.purgeCutoffs([ids[0]])[ids[0]], 15000, 'duplicate archive events without numeric rows cannot push the cutoff forward');
+  const mixed = record(ids[0], { rounds: entry(2, 16000), steps: entry(8, 15000),
+    tokensPerSecond: entry(35, 12000, { source: 'monitor', approximate: true }) },
+    { revision: 'e'.repeat(64), pendingVersion: 100 });
+  assert.equal(store.write([mixed]).length, 1);
+  const freshUndo = store.read(key(ids[0]));
+  assert.equal(freshUndo.fields.rounds.value, 2);
+  assert.equal(freshUndo.fields.steps, undefined, 'the exact cutoff boundary is also excluded');
+  assert.equal(freshUndo.fields.tokensPerSecond, undefined, 'a fresh record timestamp cannot smuggle an old per-field speed through the fence');
+  assert.equal(store.write([record(ids[0], { tokensPerSecond: entry(40, 16000, { source: 'monitor', approximate: true }) },
+    { revision: 'e'.repeat(64), pendingVersion: 101 })]).length, 1);
+  assert.equal(store.read(key(ids[0])).fields.tokensPerSecond.value, 40);
+  assert.equal(store.read(key(ids[1])).fields.rounds.value, 1, 'one UUID purge cannot affect active conversations');
+  const fenceInspector = new DatabaseSync(file, { readOnly: true });
+  assert.equal(fenceInspector.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.deepEqual(fenceInspector.prepare('PRAGMA table_info(thread_metric_purge_fences)').all().map(column => column.name), ['thread_hash', 'cutoff_at']);
+  const fenceRow = fenceInspector.prepare('SELECT * FROM thread_metric_purge_fences').get();
+  assert.match(fenceRow.thread_hash, /^[a-f0-9]{64}$/);
+  assert.equal(fenceRow.cutoff_at, 15000);
+  assert.doesNotMatch(JSON.stringify(fenceRow), /00000000-0000-0000-0000|tokensPerSecond|value/);
+  fenceInspector.close();
+
+  // Recreate the previous real schema without a fence table. Opening v2 must
+  // migrate it atomically, keeping all active per-conversation metric rows.
+  const legacyFile = path.join(temp, 'legacy-v1.sqlite');
+  const legacyBuilder = new ThreadMetricsStore({ file: legacyFile, now: () => at });
+  legacyBuilder.write([record(ids[2], { rounds: entry(5), tokensPerSecond: entry(25) })]);
+  legacyBuilder.stop();
+  const legacyDatabase = new DatabaseSync(legacyFile);
+  legacyDatabase.exec('DROP TABLE thread_metric_purge_fences; PRAGMA user_version=1'); legacyDatabase.close();
+  const migrated = new ThreadMetricsStore({ file: legacyFile, now: () => at });
+  assert.equal(migrated.read(key(ids[2])).fields.rounds.value, 5);
+  assert.equal(migrated.read(key(ids[2])).fields.tokensPerSecond.value, 25);
+  assert.equal(Object.keys(migrated.purgeCutoffs([ids[2]])).length, 0);
+  migrated.stop();
+  const migrationInspector = new DatabaseSync(legacyFile, { readOnly: true });
+  assert.equal(migrationInspector.prepare('PRAGMA user_version').get().user_version, 2);
+  migrationInspector.close();
   console.log('PASS durable SQLite metrics across 150 threads and reopen, account/storage isolation, private projection, per-field timestamp merge, partial/null retention, revision resets, strict validation, committed-only acknowledgements, safe permissions and failed/busy writes');
 } finally { store?.stop(); fs.rmSync(temp, { recursive: true, force: true }); }

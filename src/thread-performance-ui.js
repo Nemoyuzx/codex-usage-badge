@@ -1,5 +1,5 @@
 function installThreadPerformanceMonitor(createTracker) {
-  const VERSION = 3;
+  const VERSION = 4;
   const KEY = '__codexThreadPerformance';
   if (window[KEY]?.version === VERSION) return;
   window[KEY]?.destroy?.();
@@ -21,6 +21,7 @@ function installThreadPerformanceMonitor(createTracker) {
   let failures = 0;
   let lastNotificationAt = null;
   const trackedIds = new Set();
+  const archivedIds = new Set();
   function captureThread(id) {
     try { window.__codexThreadMetrics?.captureThread?.(id); } catch {}
   }
@@ -84,10 +85,23 @@ function installThreadPerformanceMonitor(createTracker) {
         }
         return;
       }
+      if (message.type === 'mcp-notification' && ['thread/archived', 'thread/unarchived'].includes(message.method)) {
+        const id = message.params?.threadId;
+        if (typeof id !== 'string' || !UUID.test(id)) return;
+        if (message.method === 'thread/archived') {
+          archivedIds.add(id); tracker.forget?.(id); trackedIds.delete(id);
+          window.__codexThreadMetrics?.archiveThread?.(id);
+        } else {
+          archivedIds.delete(id); tracker.forget?.(id); trackedIds.delete(id);
+          window.__codexThreadMetrics?.unarchiveThread?.(id);
+        }
+        return;
+      }
       if (!connected || paused || message.type !== 'mcp-notification') return;
       const record = project(message);
       if (!record) return;
       const id = record.params.threadId;
+      if (archivedIds.has(id)) return;
       // Persist a thread's last known values before an epoch reset or LRU
       // eviction, including conversations whose composer is not in view.
       if (!trackedIds.has(id) && trackedIds.size >= 16) {
@@ -117,7 +131,9 @@ function installThreadPerformanceMonitor(createTracker) {
   }
   window[KEY] = {
     version: VERSION,
-    snapshot(id) { return !disposed && supported && connected && !paused && typeof id === 'string' && UUID.test(id) ? tracker.snapshot(id) : null; },
+    snapshot(id) { return !disposed && supported && connected && !paused && !archivedIds.has(id) && typeof id === 'string' && UUID.test(id) ? tracker.snapshot(id) : null; },
+    archiveThread(id) { if (typeof id === 'string' && UUID.test(id)) { archivedIds.add(id); tracker.forget?.(id); trackedIds.delete(id); } },
+    unarchiveThread(id) { if (typeof id === 'string' && UUID.test(id)) { archivedIds.delete(id); tracker.forget?.(id); trackedIds.delete(id); } },
     reset(id) {
       if (typeof id === 'string' && UUID.test(id)) { tracker.reset(id); trackedIds.delete(id); }
       else clearMeasurements();
@@ -127,7 +143,7 @@ function installThreadPerformanceMonitor(createTracker) {
     destroy() {
       disposed = true; window.removeEventListener('message', onMessage);
       document.removeEventListener('visibilitychange', onVisibility); window.removeEventListener('focus', onVisibility);
-      trackedIds.clear(); tracker.stop();
+      trackedIds.clear(); archivedIds.clear(); tracker.stop();
       if (window[KEY] === this) delete window[KEY];
     }
   };

@@ -1,5 +1,5 @@
 function installThreadMetrics() {
-  const VERSION = 3;
+  const VERSION = 4;
   const KEY = '__codexThreadMetrics';
   const MARK = 'data-codex-thread-metrics';
   const ROOT = '[data-codex-composer-root][data-composer-placement="thread"]';
@@ -38,6 +38,11 @@ function installThreadMetrics() {
   const localProofs = new Set();
   const nativeProofs = new Set();
   const observedIds = new Set();
+  const archivedIds = new Set();
+  const archiveTimes = new Map();
+  const unarchiveTimes = new Map();
+  const awaitingUnarchiveProof = new Set();
+  const pendingArchiveIds = new Map();
   const loaded = new Set();
   const threadScopes = new Map();
   let lastSerialized = new Map();
@@ -123,6 +128,7 @@ function installThreadMetrics() {
       row.getAttribute('data-app-action-sidebar-thread-host-id') === 'local' &&
       row.getAttribute('data-app-action-sidebar-thread-kind') === 'local');
     if (contradicts || accountBlocked) return { root, id: null, candidate: null };
+    if (archivedIds.has(id) || awaitingUnarchiveProof.has(id)) return { root, id: null, candidate: id };
     return { root, id: local || localProofs.has(id) || nativeProofs.has(id) ? id : null, candidate: id };
   }
   const nonnegative = number => typeof number === 'number' && Number.isFinite(number) && number >= 0;
@@ -162,6 +168,7 @@ function installThreadMetrics() {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !validField(field, entry.value) || !validAt(entry.at) ||
         !['file', 'monitor'].includes(entry.source) || typeof entry.approximate !== 'boolean' || typeof entry.lowerBound !== 'boolean' ||
         Object.keys(entry).some(key => !['value', 'at', 'source', 'approximate', 'lowerBound', 'observedSince', 'observedResponses'].includes(key))) return null;
+      if (entry.at <= (archiveTimes.get(id) ?? 0)) continue;
       const clean = { value: entry.value, at: entry.at, source: entry.source, approximate: entry.approximate, lowerBound: entry.lowerBound };
       if (validAt(entry.observedSince)) clean.observedSince = entry.observedSince;
       if (Number.isSafeInteger(entry.observedResponses) && entry.observedResponses >= 0) clean.observedResponses = entry.observedResponses;
@@ -178,6 +185,7 @@ function installThreadMetrics() {
   }
   function storageKey(id) { return `${STORAGE_PREFIX}${actorScopeId}:${threadScopes.get(id) ?? scopeId}:${id}`; }
   function loadHistory(id) {
+    if (archivedIds.has(id) || awaitingUnarchiveProof.has(id)) return;
     if (!actorVerified || !actorScopeId || !threadScopes.has(id) || loaded.has(id)) return;
     loaded.add(id);
     try {
@@ -201,6 +209,7 @@ function installThreadMetrics() {
     } catch { /* Blocked storage leaves the bounded in-memory history usable. */ }
   }
   function persist(id, record) {
+    if (archivedIds.has(id) || awaitingUnarchiveProof.has(id)) return;
     const localScope = threadScopes.get(id);
     if (!actorVerified || !actorScopeId || !localScope || accountBlocked || !localProofs.has(id) || !Object.keys(record.fields).length) return;
     record.actorScopeId = actorScopeId; record.scopeId = localScope;
@@ -216,6 +225,7 @@ function installThreadMetrics() {
     } catch { storageFailures++; }
   }
   function remember(id, field, value, metadata) {
+    if (archivedIds.has(id) || awaitingUnarchiveProof.has(id) || metadata.at <= (archiveTimes.get(id) ?? 0)) return false;
     if (!validField(field, value) || !validAt(metadata.at)) return false;
     let record = history.get(id);
     if (!record) record = { version: 1, scopeId: threadScopes.get(id) ?? scopeId, actorScopeId,
@@ -283,22 +293,28 @@ function installThreadMetrics() {
     scopeCheckedAt = validAt(carried.scopeCheckedAt) ? carried.scopeCheckedAt : 0;
     accountChangedAt = validAt(carried.accountChangedAt) ? carried.accountChangedAt : 0;
     accountBlocked = carried.accountBlocked === true;
+    for (const id of Array.isArray(carried.archivedIds) ? carried.archivedIds : []) if (typeof id === 'string' && UUID.test(id)) archivedIds.add(id);
+    for (const [id, at] of Array.isArray(carried.archiveTimes) ? carried.archiveTimes : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) archiveTimes.set(id, at);
+    for (const [id, at] of Array.isArray(carried.unarchiveTimes) ? carried.unarchiveTimes : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) unarchiveTimes.set(id, at);
+    for (const id of Array.isArray(carried.awaitingUnarchiveProof) ? carried.awaitingUnarchiveProof : []) if (typeof id === 'string' && UUID.test(id)) awaitingUnarchiveProof.add(id);
+    for (const [id, at] of Array.isArray(carried.pendingArchiveIds) ? carried.pendingArchiveIds : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) pendingArchiveIds.set(id, at);
     for (const value of Array.isArray(carried.records) ? carried.records : []) {
       if (typeof value?.threadId !== 'string' || !UUID.test(value.threadId)) continue;
+      if (archivedIds.has(value.threadId) || awaitingUnarchiveProof.has(value.threadId)) continue;
       if (typeof value.scopeId === 'string' && SCOPE.test(value.scopeId)) threadScopes.set(value.threadId, value.scopeId);
       const record = cleanRecord(value, value.threadId);
       if (record) touch(value.threadId, record);
     }
-    for (const id of Array.isArray(carried.proofIds) ? carried.proofIds : []) if (typeof id === 'string' && UUID.test(id)) localProofs.add(id);
-    for (const id of Array.isArray(carried.nativeProofIds) ? carried.nativeProofIds : []) if (typeof id === 'string' && UUID.test(id)) nativeProofs.add(id);
-    for (const id of Array.isArray(carried.observedIds) ? carried.observedIds : []) if (typeof id === 'string' && UUID.test(id)) observedIds.add(id);
+    for (const id of Array.isArray(carried.proofIds) ? carried.proofIds : []) if (typeof id === 'string' && UUID.test(id) && !archivedIds.has(id) && !awaitingUnarchiveProof.has(id)) localProofs.add(id);
+    for (const id of Array.isArray(carried.nativeProofIds) ? carried.nativeProofIds : []) if (typeof id === 'string' && UUID.test(id) && !archivedIds.has(id) && !awaitingUnarchiveProof.has(id)) nativeProofs.add(id);
+    for (const id of Array.isArray(carried.observedIds) ? carried.observedIds : []) if (typeof id === 'string' && UUID.test(id) && !archivedIds.has(id)) observedIds.add(id);
     for (const value of Array.isArray(carried.pending) ? carried.pending : []) {
       if (Number.isSafeInteger(value?.pendingVersion) && value.pendingVersion > 0 && typeof value.actorScopeId === 'string' && SCOPE.test(value.actorScopeId) &&
         typeof value.scopeId === 'string' && SCOPE.test(value.scopeId) && typeof value.threadId === 'string' && UUID.test(value.threadId)) {
         const { pendingVersion: version, producerId: producer, ...body } = value;
         if (typeof producer !== 'string' || !UUID.test(producer)) continue;
         const record = cleanRecord(body, value.threadId, value.scopeId, value.actorScopeId);
-        if (!record) continue;
+        if (!record || archivedIds.has(value.threadId) || awaitingUnarchiveProof.has(value.threadId)) continue;
         const key = `${STORAGE_PREFIX}${value.actorScopeId}:${value.scopeId}:${value.threadId}`;
         dirty.set(key, { ...record, pendingVersion: version, producerId: producer }); queuedSerialized.set(key, JSON.stringify(record));
         pendingVersion = Math.max(pendingVersion, value.pendingVersion);
@@ -307,10 +323,11 @@ function installThreadMetrics() {
   }
   function collect(id) {
     const stale = Number.isFinite(snapshot.checkedAt) && Date.now() - snapshot.checkedAt > 30000;
-    const metric = id && snapshot.ok && !accountBlocked && snapshot.checkedAt >= actorEpochAt && Object.hasOwn(snapshot.perThread, id)
+    const metric = id && !archivedIds.has(id) && !awaitingUnarchiveProof.has(id) && snapshot.checkedAt > (archiveTimes.get(id) ?? 0) &&
+      snapshot.ok && !accountBlocked && snapshot.checkedAt >= actorEpochAt && Object.hasOwn(snapshot.perThread, id)
       ? snapshot.perThread[id] : null;
     const freshFields = new Set();
-    if (!id || accountBlocked) return { metric, freshFields, stale };
+    if (!id || accountBlocked || archivedIds.has(id) || awaitingUnarchiveProof.has(id)) return { metric, freshFields, stale };
     loadHistory(id);
     if (metric) {
       let record = history.get(id);
@@ -350,9 +367,9 @@ function installThreadMetrics() {
       const candidate = health?.supported === true && health.active === true && health.connected === true ? monitor.snapshot(id) : null;
       if (candidate?.timingApproximate === true && Number.isSafeInteger(candidate.observedResponses) && candidate.observedResponses > 0 &&
         validAt(candidate.observedSince) && validAt(candidate.lastSampleAt) && candidate.lastSampleAt >= candidate.observedSince &&
-        candidate.observedSince >= accountChangedAt) measured = candidate;
+        candidate.observedSince >= Math.max(accountChangedAt, archiveTimes.get(id) ?? 0, unarchiveTimes.get(id) ?? 0)) measured = candidate;
       if (candidate?.countersLowerBound === true && validAt(candidate.countersUpdatedAt) &&
-        validAt(candidate.countersObservedSince) && candidate.countersObservedSince >= accountChangedAt) counters = candidate;
+        validAt(candidate.countersObservedSince) && candidate.countersObservedSince >= Math.max(accountChangedAt, archiveTimes.get(id) ?? 0, unarchiveTimes.get(id) ?? 0)) counters = candidate;
     } catch { /* A missing or replaced monitor leaves only the file-backed values. */ }
     if (measured) for (const field of ['llmDurationMs', 'tokensPerSecond']) {
       if (remember(id, field, measured[field], { at: measured.lastSampleAt, source: 'monitor', approximate: true, lowerBound: false,
@@ -453,6 +470,8 @@ function installThreadMetrics() {
   }
   function captureThread(id) {
     if (disposed || typeof id !== 'string' || !UUID.test(id)) return;
+    if (archivedIds.has(id)) return;
+    if (awaitingUnarchiveProof.has(id)) { observedIds.add(id); return; }
     syncActor();
     if (accountBlocked) return;
     nativeProofs.add(id); observedIds.add(id); collect(id);
@@ -464,7 +483,7 @@ function installThreadMetrics() {
       if (!UUID.test(id) || !metric || typeof metric !== 'object' || Array.isArray(metric)) continue;
       const clean = {};
       for (const field of Object.keys(formatters)) clean[field] = validField(field, metric[field]) ? metric[field] : null;
-      for (const field of ['localVerified', 'complete', 'roundsComplete', 'stepsComplete', 'countersLowerBound', 'countersReset', 'timingApproximate', 'backfilling'])
+      for (const field of ['localVerified', 'archived', 'complete', 'roundsComplete', 'stepsComplete', 'countersLowerBound', 'countersReset', 'timingApproximate', 'backfilling'])
         if (typeof metric[field] === 'boolean') clean[field] = metric[field];
       for (const field of ['scopeId', 'revision']) if (typeof metric[field] === 'string' && SCOPE.test(metric[field])) clean[field] = metric[field].toLowerCase();
       if (Number.isSafeInteger(metric.rolloutSize) && metric.rolloutSize >= 0) clean.rolloutSize = metric.rolloutSize;
@@ -475,19 +494,118 @@ function installThreadMetrics() {
     }
     return projected;
   }
+  function purgeArchivedBefore(id, cutoff) {
+    if (disposed || typeof id !== 'string' || !UUID.test(id) || !validAt(cutoff)) return;
+    const priorCutoff = archiveTimes.get(id) ?? 0;
+    archiveTimes.set(id, Math.max(archiveTimes.get(id) ?? 0, cutoff));
+    if (cutoff > priorCutoff) {
+      let since = null;
+      try { since = window.__codexThreadPerformance?.snapshot?.(id)?.observedSince ?? null; } catch {}
+      if (!validAt(since) || since < cutoff) window.__codexThreadPerformance?.reset?.(id);
+    }
+    const record = history.get(id);
+    if (record) {
+      const clean = cleanRecord(record, id, record.scopeId, record.actorScopeId);
+      if (clean) touch(id, clean); else history.delete(id);
+    }
+    for (const [key, pending] of dirty) if (pending.threadId === id) {
+      const { pendingVersion: version, producerId: producer, ...body } = pending;
+      const clean = cleanRecord(body, id, body.scopeId, body.actorScopeId);
+      if (!clean) { dirty.delete(key); queuedSerialized.delete(key); }
+      else if (Object.keys(clean.fields).length !== Object.keys(body.fields).length) {
+        const serialized = JSON.stringify(clean);
+        dirty.set(key, { ...clean, pendingVersion: ++pendingVersion, producerId });
+        queuedSerialized.set(key, serialized);
+      }
+      acknowledged.delete(key);
+    }
+    lastSerialized.delete(id); loaded.delete(id);
+    try {
+      const keys = [];
+      for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        if (key?.startsWith(STORAGE_PREFIX) && key.endsWith(`:${id}`)) keys.push(key);
+      }
+      for (const key of keys) {
+        let clean = null;
+        try {
+          const value = JSON.parse(localStorage.getItem(key));
+          clean = cleanRecord(value, id, value.scopeId, value.actorScopeId);
+        } catch {}
+        if (clean) localStorage.setItem(key, JSON.stringify(clean)); else localStorage.removeItem(key);
+        acknowledged.delete(key);
+      }
+    } catch { storageFailures++; }
+    refresh();
+  }
+  function archiveThread(id, { queue = true, checkedAt = null } = {}) {
+    if (disposed || typeof id !== 'string' || !UUID.test(id)) return;
+    if (archivedIds.has(id)) return;
+    const at = validAt(checkedAt) ? checkedAt : Math.max(Date.now(), (unarchiveTimes.get(id) ?? 0) + 1);
+    if (at < (unarchiveTimes.get(id) ?? 0)) return;
+    archiveTimes.set(id, Math.max(archiveTimes.get(id) ?? 0, at));
+    archivedIds.add(id); awaitingUnarchiveProof.delete(id);
+    if (queue) pendingArchiveIds.set(id, Math.max(pendingArchiveIds.get(id) ?? 0, at));
+    history.delete(id); lastSerialized.delete(id); loaded.delete(id);
+    threadScopes.delete(id); localProofs.delete(id); nativeProofs.delete(id); observedIds.delete(id);
+    delete snapshot.perThread[id];
+    for (const map of [dirty, queuedSerialized, acknowledged]) for (const key of map.keys()) if (key.endsWith(`:${id}`)) map.delete(key);
+    if (typeof window.__codexThreadPerformance?.archiveThread === 'function') window.__codexThreadPerformance.archiveThread(id);
+    else window.__codexThreadPerformance?.reset?.(id);
+    try {
+      const keys = [];
+      for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        if (key?.startsWith(STORAGE_PREFIX) && key.endsWith(`:${id}`)) keys.push(key);
+      }
+      for (const key of keys) localStorage.removeItem(key);
+    } catch { storageFailures++; }
+    refresh();
+  }
+  function unarchiveThread(id, { checkedAt = null } = {}) {
+    if (disposed || typeof id !== 'string' || !UUID.test(id)) return;
+    if (!archivedIds.has(id) && (awaitingUnarchiveProof.has(id) || unarchiveTimes.has(id))) return;
+    const at = validAt(checkedAt) ? checkedAt : Math.max(Date.now(), (archiveTimes.get(id) ?? 0) + 1);
+    if (at <= (archiveTimes.get(id) ?? 0) || at < (unarchiveTimes.get(id) ?? 0)) return;
+    unarchiveTimes.set(id, at); archivedIds.delete(id); awaitingUnarchiveProof.add(id);
+    localProofs.delete(id); nativeProofs.delete(id); threadScopes.delete(id); loaded.delete(id); lastSerialized.delete(id);
+    delete snapshot.perThread[id]; observedIds.add(id);
+    if (typeof window.__codexThreadPerformance?.unarchiveThread === 'function') window.__codexThreadPerformance.unarchiveThread(id);
+    else window.__codexThreadPerformance?.reset?.(id);
+    refresh();
+  }
   window[KEY] = {
     version: VERSION, refresh,
     requestedIds,
     persistenceContext() { syncActor(); return { actorScopeId: actorVerified && !accountBlocked ? actorScopeId : null }; },
     requestedContext() { return { ...this.persistenceContext(), threadIds: requestedIds() }; },
     captureThread, observe: captureThread,
+    archiveThread, unarchiveThread, purgeArchivedBefore, discardBefore: purgeArchivedBefore,
+    pendingArchives() { return [...pendingArchiveIds].map(([threadId, archivedAt]) => ({ threadId, archivedAt })); },
+    ackArchives(records) {
+      for (const record of Array.isArray(records) ? records : []) {
+        if (typeof record?.threadId === 'string' && pendingArchiveIds.get(record.threadId) === record.archivedAt) pendingArchiveIds.delete(record.threadId);
+      }
+    },
     update(next) {
       syncActor();
       if (!acceptScope(next)) { refresh(); return; }
+      for (const id of Array.isArray(next?.archivedIds) ? next.archivedIds : []) archiveThread(id, { queue: false, checkedAt: next.checkedAt });
+      for (const removal of Array.isArray(next?.removedMetrics) ? next.removedMetrics : []) purgeArchivedBefore(removal?.threadId, removal?.archivedAt);
+      for (const [id, cutoff] of Object.entries(next?.purgedBefore && typeof next.purgedBefore === 'object' ? next.purgedBefore : {})) purgeArchivedBefore(id, cutoff);
       snapshot = { ok: next?.ok === true, checkedAt: validAt(next?.checkedAt) ? next.checkedAt : null,
         perThread: projectMetrics(next?.perThread) };
       for (const [id, metric] of Object.entries(snapshot.perThread)) {
         if (!UUID.test(id) || !metric || typeof metric !== 'object') continue;
+        if (metric.archived === true) { archiveThread(id, { queue: false, checkedAt: snapshot.checkedAt }); delete snapshot.perThread[id]; continue; }
+        if (archivedIds.has(id) && metric.archived === false && metric.localVerified === true && snapshot.checkedAt > (archiveTimes.get(id) ?? 0)) {
+          unarchiveThread(id, { checkedAt: snapshot.checkedAt }); snapshot.perThread[id] = metric;
+        }
+        if (archivedIds.has(id) || snapshot.checkedAt <= (archiveTimes.get(id) ?? 0) || snapshot.checkedAt < (unarchiveTimes.get(id) ?? 0)) { delete snapshot.perThread[id]; continue; }
+        if (awaitingUnarchiveProof.has(id)) {
+          if (metric.localVerified !== true) { delete snapshot.perThread[id]; continue; }
+          awaitingUnarchiveProof.delete(id);
+        }
         if (snapshot.ok && snapshot.checkedAt >= actorEpochAt && metric.localVerified === true && !accountBlocked) {
           const localScope = typeof metric.scopeId === 'string' && SCOPE.test(metric.scopeId) ? metric.scopeId : scopeId;
           const priorScope = threadScopes.get(id);
@@ -536,11 +654,14 @@ function installThreadMetrics() {
       }
     },
     retainedState() { return { version: 1, producerId, scopeId, actorScopeId, actorEpochAt, scopeCheckedAt, accountChangedAt, accountBlocked,
-      records: [...history.values()], proofIds: [...localProofs], nativeProofIds: [...nativeProofs], observedIds: [...observedIds], pending: this.pendingSnapshots() }; },
+      records: [...history.values()], proofIds: [...localProofs], nativeProofIds: [...nativeProofs], observedIds: [...observedIds], pending: this.pendingSnapshots(),
+      archivedIds: [...archivedIds], archiveTimes: [...archiveTimes], unarchiveTimes: [...unarchiveTimes],
+      awaitingUnarchiveProof: [...awaitingUnarchiveProof], pendingArchiveIds: [...pendingArchiveIds] }; },
     status() { return { version: VERSION, placed: strip.isConnected && !strip.hidden && visible(strip),
       threadId, state: strip.dataset.state, available: [...values.values()].filter(el => el.textContent !== '').length,
       checkedAt: snapshot.checkedAt, ok: snapshot.ok, cachedThreads: history.size, pendingSnapshots: dirty.size,
-      actorVerified, accountBlocked, storageFailures, stripCount: document.querySelectorAll(`[${MARK}]`).length }; },
+      actorVerified, accountBlocked, storageFailures, archivedThreads: archivedIds.size, pendingArchives: pendingArchiveIds.size,
+      stripCount: document.querySelectorAll(`[${MARK}]`).length }; },
     destroy({ clearStorage = false } = {}) {
       disposed = true; observer.disconnect(); resizeObserver.disconnect();
       clearTimeout(refreshTimer); clearInterval(freshnessTimer);

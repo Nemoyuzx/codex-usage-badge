@@ -323,6 +323,59 @@ async function select(page, name) {
     await verifiedUpdate({ [A]: verified({ rounds: 2 }, { revision: 'f'.repeat(64), rolloutSize: 20, rolloutMtimeMs: 2 }) });
     assert.equal((await metricValues(page)).rounds, '2');
     assert.equal((await metricValues(page)).steps, '', 'actual rollout replacement clears values from the old revision');
+    await verifiedUpdate({ [A]: verified(), [B]: verified({ ...metrics, rounds: 7 }) });
+    const beforeArchive = await page.evaluate(id => window.__codexThreadMetrics.pendingSnapshots().find(record => record.threadId === id), A);
+    const { producerId: oldProducer, pendingVersion: oldVersion, ...oldSaved } = beforeArchive;
+    await page.evaluate(({ id, saved, actor }) => {
+      localStorage.setItem(`codex-usage-badge.thread-metrics.v1:${actor}:${'9'.repeat(64)}:${id}`,
+        JSON.stringify({ ...saved, actorScopeId: actor, scopeId: '9'.repeat(64) }));
+      window.__codexThreadMetrics.archiveThread(id);
+    }, { id: A, saved: oldSaved, actor: otherActor });
+    await assertBlank(page);
+    const archiveRequest = await page.evaluate(() => window.__codexThreadMetrics.pendingArchives());
+    assert.equal(archiveRequest.length, 1); assert.equal(archiveRequest[0].threadId, A);
+    assert.equal(await page.evaluate(id => Object.keys(localStorage).some(key => key.startsWith('codex-usage-badge.thread-metrics.v1:') && key.endsWith(':' + id)), A), false,
+      'archive deletes matching metric keys across every actor/local namespace');
+    assert.equal(await page.evaluate(id => window.__codexThreadMetrics.pendingSnapshots().some(record => record.threadId === id), A), false);
+    await page.evaluate(({ id, acknowledgement }) => {
+      window.__codexThreadMetrics.archiveThread(id); window.__codexThreadMetrics.captureThread(id);
+      window.__codexThreadMetrics.ackPersisted([acknowledgement]);
+    }, { id: A, acknowledgement: beforeArchive });
+    assert.deepEqual(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives()), archiveRequest, 'duplicate archive notifications are idempotent');
+    await verifiedUpdate({ [A]: verified() }, { [A]: oldSaved });
+    await assertBlank(page);
+    assert.ok((await page.evaluate(() => window.__codexThreadMetrics.requestedIds())).includes(A), 'blocked visible IDs remain available for authoritative archive status checks');
+    await select(page, 'b');
+    assert.equal((await metricValues(page)).rounds, '7', 'archiving another conversation preserves the current one');
+    await page.evaluate(id => window.__codexThreadMetrics.unarchiveThread(id), A);
+    assert.deepEqual(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives()), archiveRequest, 'rapid unarchive does not cancel deletion of old saved statistics');
+    await select(page, 'a');
+    await assertBlank(page);
+    await verifiedUpdate({ [A]: verified({}, { archived: false }) }, { [A]: oldSaved });
+    await assertBlank(page);
+    await page.evaluate(records => window.__codexThreadMetrics.ackArchives(records.map(record => ({ ...record, archivedAt: record.archivedAt - 1 }))), archiveRequest);
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives().length), 1, 'an old archive acknowledgement cannot consume a newer deletion request');
+    await page.evaluate(records => window.__codexThreadMetrics.ackArchives(records), archiveRequest);
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives().length), 0);
+    await verifiedUpdate({ [A]: verified({ rounds: 3, tokensPerSecond: 80 }, { archived: false }) });
+    assert.equal((await metricValues(page)).rounds, '3');
+    assert.equal((await metricValues(page)).tokensPerSecond, '80', 'fresh verified collection resumes after unarchive');
+    await page.evaluate(({ id, cutoff }) => window.__codexThreadMetrics.discardBefore(id, cutoff), { id: A, cutoff: archiveRequest[0].archivedAt });
+    assert.equal((await metricValues(page)).rounds, '3', 'late purge notifications remove only pre-archive fields');
+    await select(page, 'b');
+    await page.evaluate(id => window.__codexThreadMetrics.archiveThread(id), A);
+    assert.equal((await metricValues(page)).rounds, '7');
+    const secondArchive = await page.evaluate(() => window.__codexThreadMetrics.pendingArchives());
+    await page.evaluate(records => window.__codexThreadMetrics.ackArchives(records), archiveRequest);
+    assert.deepEqual(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives()), secondArchive, 'old deletion acknowledgements cannot drop a second archive cycle');
+    await page.waitForTimeout(10);
+    await verifiedUpdate({ [A]: verified({ rounds: 4 }, { archived: false }) }, { [A]: oldSaved });
+    await select(page, 'a');
+    assert.equal((await metricValues(page)).rounds, '4', 'fresh database status can recover from a missed native unarchive event');
+    assert.equal((await metricValues(page)).steps, '', 'deleted saved fields remain absent until freshly collected');
+    await page.evaluate(({ id, cutoff }) => window.__codexThreadMetrics.update({ ok: true, checkedAt: Date.now(),
+      scopeId: 'd'.repeat(64), perThread: {}, archivedIds: [id], purgedBefore: { [id]: cutoff } }), { id: A, cutoff: Date.now() });
+    await assertBlank(page);
     await page.evaluate(() => { localStorage.setItem('unrelated-setting', 'keep'); window.__codexThreadMetrics.destroy({ clearStorage: true }); });
     assert.equal(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith('codex-usage-badge.thread-metrics.v1:'))), false);
     assert.equal(await page.evaluate(() => localStorage.getItem('unrelated-setting')), 'keep');

@@ -150,6 +150,41 @@ async function scalarValues(page) {
     await page.locator('[data-app-action-sidebar-thread-row]').first().evaluate(element => element.setAttribute('data-app-action-sidebar-thread-host-id', 'remote'));
     await page.evaluate(() => window.__codexThreadMetrics.refresh());
     assert.equal((await scalarValues(page)).llmDurationMs, '', 'unverified local identity must hide even real monitor data');
+    await page.locator('[data-app-action-sidebar-thread-row]').first().evaluate(element => element.setAttribute('data-app-action-sidebar-thread-host-id', 'local'));
+    await page.evaluate(() => window.__codexThreadMetrics.refresh());
+    const lastKnown = await scalarValues(page);
+    await emit(page, 'thread/closed', { threadId: A });
+    await emit(page, 'thread/archived', { threadId: A }, { source: 'window' });
+    await emit(page, 'thread/archived', { threadId: A }, { data: { hostId: 'remote-machine' } });
+    assert.deepEqual(await scalarValues(page), lastKnown, 'closing a thread and external/remote archive-shaped messages do not purge metrics');
+    await page.evaluate(() => {
+      window.archiveHidden = true;
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => window.archiveHidden });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await emit(page, 'thread/archived', { threadId: A });
+    assert.equal(Object.values(await scalarValues(page)).every(value => value === ''), true, 'trusted archive purges even while monitoring is paused');
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingArchives().length), 1);
+    await page.evaluate(value => { window.fixtureClock = value; }, base + 100010);
+    await emit(page, 'thread/unarchived', { threadId: A });
+    assert.equal(Object.values(await scalarValues(page)).every(value => value === ''), true, 'unarchive waits for fresh backend proof');
+    await page.evaluate(({ id, value }) => {
+      window.archiveHidden = false; delete document.hidden;
+      window.fixtureClock = value; document.dispatchEvent(new Event('visibilitychange'));
+      window.__codexThreadMetrics.update({ ok: true, checkedAt: value,
+        perThread: { [id]: { localVerified: true, archived: false, complete: true } } });
+    }, { id: A, value: base + 100020 });
+    await page.evaluate(({ id, value }) => {
+      window.fixtureClock = value;
+      window.__codexThreadMetrics.discardBefore(id, value);
+    }, { id: A, value: base + 100030 });
+    const nextTurn = '00000000-0000-0000-0000-000000000099';
+    await at(100100, 'turn/started', { threadId: A, turn: { id: nextTurn, status: 'inProgress' } });
+    await at(100202, 'item/started', { threadId: A, turnId: nextTurn, item: { id: 'rs_after_purge', type: 'reasoning' }, startedAtMs: base + 100200 });
+    await at(100401, 'item/completed', { threadId: A, turnId: nextTurn, item: { id: 'rs_after_purge', type: 'reasoning' }, completedAtMs: base + 100400 });
+    await at(100700, 'thread/tokenUsage/updated', { threadId: A, turnId: nextTurn, tokenUsage: { total: tokens(200), last: tokens(100) } });
+    await page.evaluate(() => window.__codexThreadMetrics.refresh());
+    assert.equal((await scalarValues(page)).tokensPerSecond, '≈200', 'a late purge establishes a new eligible monitoring epoch instead of permanently disabling fresh samples');
     await page.evaluate(() => {
       window.__codexThreadPerformance.destroy(); window.__codexThreadMetrics.destroy(); Date.now = window.realDateNow;
     });

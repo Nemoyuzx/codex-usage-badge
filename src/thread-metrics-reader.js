@@ -41,24 +41,49 @@ class ThreadMetricsReader {
   }
 
   // Uses the newest schema only, following ThreadTokenReader's account isolation.
-  paths(ids) {
+  openState() {
     const fs = require('node:fs');
     const path = require('node:path');
+    const file = fs.readdirSync(this.home).filter(name => /^state_\d+\.sqlite$/.test(name))
+      .sort((a, b) => Number(b.match(/\d+/)[0]) - Number(a.match(/\d+/)[0]))[0];
+    if (!file) throw new Error('No state database');
+    const dbFile = path.join(this.home, file), stat = fs.statSync(dbFile);
+    const scopeId = require('node:crypto').createHash('sha256').update(`${fs.realpathSync(this.home)}\0${fs.realpathSync(dbFile)}\0${stat.dev}:${stat.ino}`).digest('hex');
+    if (this.scopeId !== scopeId) { this.cache.clear(); this.provenance.clear(); this.scopeId = scopeId; this.scopeEpoch++; }
+    return this.openDatabase(dbFile, { readOnly: true, timeout: 200 });
+  }
+
+  paths(ids) {
     let db;
     try {
-      const file = fs.readdirSync(this.home).filter(name => /^state_\d+\.sqlite$/.test(name))
-        .sort((a, b) => Number(b.match(/\d+/)[0]) - Number(a.match(/\d+/)[0]))[0];
-      if (!file) throw new Error('No state database');
-      const dbFile = path.join(this.home, file), stat = fs.statSync(dbFile);
-      const scopeId = require('node:crypto').createHash('sha256').update(`${fs.realpathSync(this.home)}\0${fs.realpathSync(dbFile)}\0${stat.dev}:${stat.ino}`).digest('hex');
-      if (this.scopeId !== scopeId) { this.cache.clear(); this.provenance.clear(); this.scopeId = scopeId; this.scopeEpoch++; }
-      db = this.openDatabase(path.join(this.home, file), { readOnly: true, timeout: 200 });
+      db = this.openState();
+      const scopeId = this.scopeId;
       const columns = db.prepare('PRAGMA table_info(threads)').all();
       const owner = columns.some(column => column.name === 'creator_account_id');
-      const rows = db.prepare(`SELECT id, rollout_path${owner ? ', creator_account_id' : ''} FROM threads WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
-      return rows.map(row => ({ id: row.id, rollout_path: row.rollout_path, scopeId: owner && typeof row.creator_account_id === 'string'
+      const archive = columns.some(column => column.name === 'archived');
+      const rows = db.prepare(`SELECT id, rollout_path${owner ? ', creator_account_id' : ''}${archive ? ', archived' : ''} FROM threads WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+      return rows.map(row => ({ id: row.id, rollout_path: row.rollout_path, archived: archive && row.archived === 1, scopeId: owner && typeof row.creator_account_id === 'string'
         ? require('node:crypto').createHash('sha256').update(`${scopeId}\0${row.creator_account_id}`).digest('hex') : scopeId }));
     } finally { try { db?.close(); } catch {} }
+  }
+
+  archivedIds(ids) {
+    const requested = [...new Set(Array.isArray(ids) ? ids : [])].filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id));
+    if (this.stopped) return { ok: false, scopeId: this.scopeId, ids: [] };
+    let db;
+    try {
+      db = this.openState();
+      const columns = db.prepare('PRAGMA table_info(threads)').all();
+      if (!columns.some(column => column.name === 'id') || !columns.some(column => column.name === 'archived')) throw new Error('Unknown archive schema');
+      const archived = [];
+      for (let offset = 0; offset < requested.length; offset += 200) {
+        const chunk = requested.slice(offset, offset + 200);
+        const rows = db.prepare(`SELECT id FROM threads WHERE archived=1 AND id IN (${chunk.map(() => '?').join(',')})`).all(...chunk);
+        archived.push(...rows.map(row => row.id));
+      }
+      return { ok: true, scopeId: this.scopeId, ids: archived };
+    } catch { return { ok: false, scopeId: this.scopeId, ids: [] }; }
+    finally { try { db?.close(); } catch {} }
   }
 
   indexedRounds(ids) {
@@ -94,10 +119,16 @@ class ThreadMetricsReader {
     const scopeEpoch = this.scopeEpoch, storageScopeId = this.scopeId;
     const rounds = this.indexedRounds(requested);
     let backfilling = false;
+    const archivedIds = [];
     // Sequential scans bound the total CPU and I/O budget for a refresh. Usually
     // only the current conversation is requested by each desktop window.
     for (const row of rows) {
       if (!requested.includes(row.id) || this.stopped) continue;
+      if (row.archived) {
+        archivedIds.push(row.id); this.cache.delete(row.id); this.provenance.delete(row.id);
+        perThread[row.id] = { archived: true, localVerified: true, scopeId: row.scopeId };
+        continue;
+      }
       const pendingKey = `${storageScopeId}:${row.scopeId}:${row.id}:${row.rollout_path}`;
       let pending = this.pending.get(pendingKey);
       if (!pending) {
@@ -113,8 +144,18 @@ class ThreadMetricsReader {
         if (this.pending.get(pendingKey) === pending) this.pending.delete(pendingKey);
       }
     }
+    // Archive can change while an asynchronous rollout scan is awaiting I/O.
+    // Recheck the authoritative status before returning any collected values.
+    const archiveStatus = this.archivedIds(requested);
+    if (scopeEpoch !== this.scopeEpoch) return { ok: false, perThread: Object.create(null), checkedAt, scopeId: this.scopeId, backfilling: false, archivedIds: [] };
+    if (archiveStatus.ok) for (const id of archiveStatus.ids) {
+      if (!archivedIds.includes(id)) archivedIds.push(id);
+      this.cache.delete(id); this.provenance.delete(id);
+      if (perThread[id]) perThread[id] = { archived: true, localVerified: true, scopeId: perThread[id].scopeId };
+    }
+    backfilling = Object.values(perThread).some(metric => metric.backfilling === true);
     while (this.cache.size > this.maxCachedThreads) this.cache.delete(this.cache.keys().next().value);
-    return { ok: !this.stopped, perThread, checkedAt, scopeId: this.scopeId, backfilling };
+    return { ok: !this.stopped, perThread, checkedAt, scopeId: this.scopeId, backfilling, archivedIds };
   }
 
   async safePath(file) {

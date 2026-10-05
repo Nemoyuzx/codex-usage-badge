@@ -4,21 +4,57 @@ async function refreshThreadMetrics(injector, reader, store = null) {
   if (!sessions.length) return;
   const requests = await Promise.all(sessions.map(async session => {
     try {
-      const result = await session.evaluate('(() => { const api = window.__codexThreadMetrics; return { ids: api?.requestedIds() ?? [], actorScopeId: api?.persistenceContext?.().actorScopeId ?? null, pending: api?.pendingSnapshots?.() ?? [] }; })()');
+      const result = await session.evaluate('(() => { const api = window.__codexThreadMetrics; return { ids: api?.requestedIds() ?? [], actorScopeId: api?.persistenceContext?.().actorScopeId ?? null, pending: api?.pendingSnapshots?.() ?? [], archives: api?.pendingArchives?.() ?? [] }; })()');
       const raw = result?.result?.value;
       const context = Array.isArray(raw) ? { ids: raw } : raw;
       const ids = Array.isArray(context?.ids) ? context.ids.filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)).slice(0, 32) : [];
       const actorScopeId = typeof context?.actorScopeId === 'string' && /^[a-f0-9]{64}$/i.test(context.actorScopeId) ? context.actorScopeId : null;
       const pending = Array.isArray(context?.pending) ? context.pending.slice(0, 256) : [];
-      return { session, ids, actorScopeId, pending };
-    } catch { return { session, ids: [], actorScopeId: null, pending: [] }; }
+      const archives = Array.isArray(context?.archives) ? context.archives.filter(record =>
+        typeof record?.threadId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(record.threadId) &&
+        Number.isSafeInteger(record.archivedAt) && record.archivedAt > 0 && record.archivedAt <= Date.now() + 1000) : [];
+      return { session, ids, actorScopeId, pending, archives };
+    } catch { return { session, ids: [], actorScopeId: null, pending: [], archives: [] }; }
   }));
-  if (store) for (const { session, pending } of requests) {
+  const archiveCandidates = () => [...new Set([
+    ...requests.flatMap(request => [...request.ids, ...request.pending.map(record => record?.threadId), ...request.archives.map(record => record.threadId)]),
+    ...(store?.threadIds?.() ?? [])
+  ].filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)))];
+  const checkArchives = async () => {
+    try { return typeof reader.archivedIds === 'function' ? await reader.archivedIds(archiveCandidates()) : { ok: true, ids: [] }; }
+    catch { return { ok: false, ids: [] }; }
+  };
+  const before = await checkArchives();
+  const confirmedBefore = new Set(before.ok ? before.ids : []);
+  const nativeArchives = requests.flatMap(request => request.archives);
+  const deletionIds = [...new Set([...confirmedBefore, ...nativeArchives.map(record => record.threadId)])];
+  if (store && deletionIds.length && typeof store.removeThreads === 'function') {
+    try {
+      const removed = new Set();
+      const priorCutoffs = store.purgeCutoffs?.(deletionIds) ?? {};
+      for (const id of deletionIds) {
+        const intents = nativeArchives.filter(record => record.threadId === id);
+        // A late duplicate broadcast must not erase a currently active thread's
+        // fresh post-Undo data. A current DB archive always remains authoritative.
+        if (!confirmedBefore.has(id) && priorCutoffs[id] !== undefined) { removed.add(id); continue; }
+        const options = intents.length ? { cutoffAt: Math.min(...intents.map(record => record.archivedAt)) } : {};
+        for (const cleared of await store.removeThreads([id], options)) removed.add(cleared);
+      }
+      // Archive notifications can be followed by Undo before the next poll.
+      // Their deletion still commits; a durable cutoff rejects old in-flight
+      // fields without preventing later, genuinely new observations.
+      await Promise.all(requests.map(async request => {
+        const acknowledged = request.archives.filter(record => removed.has(record.threadId));
+        if (acknowledged.length) try { await request.session.evaluate(`window.__codexThreadMetrics?.ackArchives(${JSON.stringify(acknowledged)})`); } catch {}
+      }));
+    } catch {}
+  }
+  if (store && before.ok) for (const { session, pending } of requests) {
     if (!pending.length) continue;
     try {
       // Acknowledge only committed versions. Newer observations remain queued
       // if they arrive while the previous snapshot is being saved.
-      const accepted = await store.write(pending);
+      const accepted = await store.write(pending.filter(record => !confirmedBefore.has(record?.threadId)));
       if (accepted.length) await session.evaluate(`window.__codexThreadMetrics?.ackPersisted(${JSON.stringify(accepted)})`);
     } catch { /* Keep the renderer's pending values for a later retry. */ }
   }
@@ -29,20 +65,27 @@ async function refreshThreadMetrics(injector, reader, store = null) {
     for (const request of requests) if (request.ids[index]) requested.push(request.ids[index]);
   }
   const snapshot = await reader.read([...new Set(requested)]);
+  const after = await checkArchives();
+  const archivedIds = after.ok ? after.ids : snapshot.archivedIds ?? [];
+  if (store && archivedIds.length && typeof store.removeThreads === 'function') {
+    try { await store.removeThreads(archivedIds); } catch {}
+  }
+  const archived = new Set(archivedIds);
+  const purgedBefore = store?.purgeCutoffs?.(archiveCandidates()) ?? {};
   await Promise.all(requests.map(async ({ session, ids, actorScopeId }) => {
     // Send aggregate numbers only, and only to the window that requested this thread.
     const perThread = Object.fromEntries(ids.filter(id => Object.hasOwn(snapshot.perThread, id)).map(id => [id, snapshot.perThread[id]]));
     const persistedPerThread = Object.create(null);
     if (store && actorScopeId) for (const id of ids) {
       const metric = perThread[id];
-      if (metric?.localVerified !== true || typeof metric.scopeId !== 'string' || !/^[a-f0-9]{64}$/i.test(metric.scopeId)) continue;
+      if (archived.has(id) || metric?.archived === true || metric?.localVerified !== true || typeof metric.scopeId !== 'string' || !/^[a-f0-9]{64}$/i.test(metric.scopeId)) continue;
       try {
         const saved = await store.read({ actorScopeId, scopeId: metric.scopeId, threadId: id,
           ...(typeof metric.revision === 'string' && /^[a-f0-9]{64}$/i.test(metric.revision) ? { revision: metric.revision } : {}) });
         if (saved) persistedPerThread[id] = saved;
       } catch {}
     }
-    const payload = store ? { ...snapshot, perThread, persistedPerThread } : { ...snapshot, perThread };
+    const payload = store ? { ...snapshot, perThread, persistedPerThread, archivedIds, purgedBefore } : { ...snapshot, perThread, ...(archivedIds.length ? { archivedIds } : {}) };
     try { await session.evaluate(`window.__codexThreadMetrics?.update(${JSON.stringify(payload)})`); } catch {}
   }));
   return snapshot;

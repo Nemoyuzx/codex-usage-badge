@@ -12,6 +12,7 @@ class ThreadMetricsStore {
   }
   scope(value) { return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value); }
   uuid(value) { return typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value); }
+  threadHash(value) { return require('node:crypto').createHash('sha256').update(value.toLowerCase()).digest('hex'); }
   time(value, at) { return Number.isSafeInteger(value) && value >= 0 && value <= at + 1000; }
   number(value) { return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER; }
   metric(field, value) {
@@ -56,19 +57,20 @@ class ThreadMetricsStore {
     try {
       const version = db.prepare('PRAGMA user_version').get().user_version;
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-      if (![0, 1].includes(version) || tables.some(row => !['thread_metric_snapshots', 'thread_metric_values'].includes(row.name))) throw new Error('Unknown metrics store schema');
+      if (![0, 1, 2].includes(version) || tables.some(row => !['thread_metric_snapshots', 'thread_metric_values', 'thread_metric_purge_fences'].includes(row.name))) throw new Error('Unknown metrics store schema');
       if (version === 0 && tables.length) throw new Error('Unversioned metrics store schema');
-      if (version === 1) {
+      if (version > 0) {
         const columns = {
           thread_metric_snapshots: ['actor_scope', 'local_scope', 'thread_id', 'revision', 'updated_at', 'rollout_size', 'rollout_mtime_ms'],
           thread_metric_values: ['actor_scope', 'local_scope', 'thread_id', 'field', 'value', 'measured_at', 'source', 'approximate', 'lower_bound', 'observed_since', 'observed_responses'],
         };
-        if (tables.length !== 2 || Object.entries(columns).some(([table, expected]) => {
+        if (version === 2) columns.thread_metric_purge_fences = ['thread_hash', 'cutoff_at'];
+        if (tables.length !== Object.keys(columns).length || Object.entries(columns).some(([table, expected]) => {
           const actual = db.prepare(`PRAGMA table_info(${table})`).all().map(column => column.name);
           return actual.length !== expected.length || expected.some((column, index) => actual[index] !== column);
         })) throw new Error('Unknown metrics store columns');
       }
-      db.exec('PRAGMA foreign_keys=ON');
+      db.exec('PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON');
       if (version === 0) db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS thread_metric_snapshots(
           actor_scope TEXT NOT NULL, local_scope TEXT NOT NULL, thread_id TEXT NOT NULL,
@@ -80,7 +82,11 @@ class ThreadMetricsStore {
           approximate INTEGER NOT NULL, lower_bound INTEGER NOT NULL, observed_since INTEGER, observed_responses INTEGER,
           PRIMARY KEY(actor_scope,local_scope,thread_id,field),
           FOREIGN KEY(actor_scope,local_scope,thread_id) REFERENCES thread_metric_snapshots(actor_scope,local_scope,thread_id) ON DELETE CASCADE);
-        PRAGMA user_version=1; COMMIT;`);
+        CREATE TABLE thread_metric_purge_fences(thread_hash TEXT PRIMARY KEY, cutoff_at INTEGER NOT NULL);
+        PRAGMA user_version=2; COMMIT;`);
+      if (version === 1) db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE thread_metric_purge_fences(thread_hash TEXT PRIMARY KEY, cutoff_at INTEGER NOT NULL);
+        PRAGMA user_version=2; COMMIT;`);
       if (!existed && process.platform !== 'win32') fs.chmodSync(this.file, 0o600);
       this.db = db; return db;
     } catch (error) { try { db.exec('ROLLBACK'); } catch {} try { db.close(); } catch {} throw error; }
@@ -95,6 +101,7 @@ class ThreadMetricsStore {
       db = this.open(); db.exec('BEGIN IMMEDIATE');
       const get = db.prepare('SELECT * FROM thread_metric_snapshots WHERE actor_scope=? AND local_scope=? AND thread_id=?');
       const getField = db.prepare('SELECT * FROM thread_metric_values WHERE actor_scope=? AND local_scope=? AND thread_id=? AND field=?');
+      const getFence = db.prepare('SELECT cutoff_at FROM thread_metric_purge_fences WHERE thread_hash=?');
       const remove = db.prepare('DELETE FROM thread_metric_values WHERE actor_scope=? AND local_scope=? AND thread_id=?');
       const put = db.prepare(`INSERT INTO thread_metric_snapshots VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(actor_scope,local_scope,thread_id) DO UPDATE SET revision=excluded.revision,updated_at=excluded.updated_at,
@@ -104,6 +111,12 @@ class ThreadMetricsStore {
         source=excluded.source,approximate=excluded.approximate,lower_bound=excluded.lower_bound,
         observed_since=excluded.observed_since,observed_responses=excluded.observed_responses`);
       for (const record of clean) {
+        const cutoff = getFence.get(this.threadHash(record.threadId))?.cutoff_at;
+        const freshFields = Object.entries(record.fields).filter(([, entry]) => cutoff === undefined || entry.at > cutoff);
+        if (!freshFields.length) {
+          accepted.push(this.acknowledgement(record));
+          continue; // A removed outbox version is handled, never resurrected.
+        }
         const key = [record.actorScopeId, record.scopeId, record.threadId], prior = get.get(...key);
         const revisionChanged = prior && record.revision !== null && prior.revision !== null && prior.revision !== record.revision;
         if (revisionChanged && record.updatedAt < prior.updated_at) {
@@ -115,7 +128,7 @@ class ThreadMetricsStore {
         put.run(...key, record.revision ?? prior?.revision ?? null, Math.max(record.updatedAt, prior?.updated_at ?? 0),
           newerMetadata ? record.rolloutSize ?? prior?.rollout_size ?? null : prior.rollout_size,
           newerMetadata ? record.rolloutMtimeMs ?? prior?.rollout_mtime_ms ?? null : prior.rollout_mtime_ms);
-        for (const [field, entry] of Object.entries(record.fields)) {
+        for (const [field, entry] of freshFields) {
           const old = revisionChanged ? null : getField.get(...key, field);
           // A partial backfill or a new observer epoch cannot erase a larger
           // already-confirmed historical count while the same file revision
@@ -138,10 +151,12 @@ class ThreadMetricsStore {
     if (this.stopped || !this.scope(actorScopeId) || !this.scope(scopeId) || !this.uuid(threadId) || revision != null && !this.scope(revision)) return null;
     try {
       const db = this.open(), key = [actorScopeId, scopeId, threadId];
+      const cutoff = db.prepare('SELECT cutoff_at FROM thread_metric_purge_fences WHERE thread_hash=?').get(this.threadHash(threadId))?.cutoff_at;
       const row = db.prepare('SELECT * FROM thread_metric_snapshots WHERE actor_scope=? AND local_scope=? AND thread_id=?').get(...key);
       if (!row || revision !== undefined && revision !== row.revision) return null;
       const fields = {};
       for (const entry of db.prepare('SELECT * FROM thread_metric_values WHERE actor_scope=? AND local_scope=? AND thread_id=?').all(...key)) {
+        if (cutoff !== undefined && entry.measured_at <= cutoff) continue;
         const clean = { value: entry.value, at: entry.measured_at, source: entry.source,
           approximate: Boolean(entry.approximate), lowerBound: Boolean(entry.lower_bound) };
         if (entry.observed_since !== null) clean.observedSince = entry.observed_since;
@@ -153,6 +168,47 @@ class ThreadMetricsStore {
       if (!clean) return null;
       delete clean.pendingVersion; return clean;
     } catch { return null; }
+  }
+  purgeCutoffs(ids) {
+    const result = Object.create(null);
+    if (this.stopped || !Array.isArray(ids)) return result;
+    try {
+      const query = this.open().prepare('SELECT cutoff_at FROM thread_metric_purge_fences WHERE thread_hash=?');
+      for (const id of [...new Set(ids)].filter(value => this.uuid(value))) {
+        const row = query.get(this.threadHash(id));
+        if (row && Number.isSafeInteger(row.cutoff_at) && row.cutoff_at >= 0) result[id] = row.cutoff_at;
+      }
+    } catch {}
+    return result;
+  }
+  threadIds() {
+    if (this.stopped) return [];
+    try { return this.open().prepare('SELECT DISTINCT thread_id FROM thread_metric_snapshots').all().map(row => row.thread_id).filter(id => this.uuid(id)); }
+    catch { return []; }
+  }
+  removeThreads(ids, { cutoffAt = this.now() } = {}) {
+    if (this.stopped || !Array.isArray(ids)) return [];
+    const requested = [...new Set(ids)].filter(id => this.uuid(id));
+    if (!requested.length || !this.time(cutoffAt, this.now())) return [];
+    let db;
+    try {
+      db = this.open(); db.exec('BEGIN IMMEDIATE');
+      // One UUID denotes the same conversation across account/storage cache
+      // namespaces. Remove all its plugin snapshots and their FK-cascaded fields.
+      db.exec('CREATE INDEX IF NOT EXISTS thread_metric_snapshots_thread_id_nocase ON thread_metric_snapshots(thread_id COLLATE NOCASE)');
+      const remove = db.prepare('DELETE FROM thread_metric_snapshots WHERE thread_id=? COLLATE NOCASE');
+      const getFence = db.prepare('SELECT cutoff_at FROM thread_metric_purge_fences WHERE thread_hash=?');
+      const putFence = db.prepare(`INSERT INTO thread_metric_purge_fences VALUES(?,?)
+        ON CONFLICT(thread_hash) DO UPDATE SET cutoff_at=MAX(cutoff_at,excluded.cutoff_at)`);
+      for (const id of requested) {
+        const hash = this.threadHash(id), prior = getFence.get(hash);
+        const removed = remove.run(id).changes;
+        // Repeated archive notifications for an already-purged UUID cannot move
+        // the fence forward and silently discard a genuinely fresh Undo sample.
+        if (!prior || removed > 0) putFence.run(hash, Math.max(cutoffAt, prior?.cutoff_at ?? 0));
+      }
+      db.exec('COMMIT'); return requested;
+    } catch { try { db?.exec('ROLLBACK'); } catch {} return []; }
   }
   stop() { this.stopped = true; try { this.db?.close(); } catch {} this.db = null; }
 }

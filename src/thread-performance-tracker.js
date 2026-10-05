@@ -245,10 +245,11 @@ function createThreadPerformanceTracker({
     else if (uuid(threadId)) restart(threadId, at, null, false);
   }
   function stop() { stopped = true; threads.clear(); }
+  function forget(threadId) { if (uuid(threadId)) threads.delete(threadId); }
   function status() {
     return { stopped, threads: threads.size,
       pending: [...threads.values()].filter(state => state.pending).length,
       observedResponses: [...threads.values()].reduce((sum, state) => sum + state.responses, 0) };
   }
-  return { record, snapshot, reset, stop, status };
+  return { record, snapshot, reset, forget, stop, status };
 }
