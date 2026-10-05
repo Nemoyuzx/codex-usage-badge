@@ -164,6 +164,10 @@ async function select(page, name) {
     await assertBlank(page);
     await update(page, { [B]: { ...metrics, complete: false } });
     assert.match(await page.locator(MARK).getAttribute('title'), /本地记录不完整/);
+    await update(page, { [B]: { ...metrics, timingApproximate: true } });
+    assert.equal((await metricValues(page)).llmDurationMs, '≈37m54s');
+    assert.equal((await metricValues(page)).tokensPerSecond, '≈42');
+    assert.equal((await metricValues(page)).firstTokenAvgMs, '5.9s', 'approximate response timings must not relabel logged first-token measurements');
 
     for (const id of [REMOTE, CLOUD, UNKNOWN]) {
       await page.locator('[data-page="b"] [data-above-composer-conversation-id]').evaluate((el, id) =>

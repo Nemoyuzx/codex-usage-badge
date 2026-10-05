@@ -1,6 +1,6 @@
 # Windows 使用说明
 
-本 fork 新增输入框下方的会话指标条，读取当前能确认身份的本地 Codex 会话。缺少数据的值留空；LLM 耗时和 tok/s 暂无可靠来源。自动更新仅信任 `Nemoyuzx/codex-usage-badge` 的发布包。
+本 fork 新增输入框下方的会话指标条，读取当前能确认身份的本地 Codex 会话。`≈LLM` / `≈tok/s` 来自完整观测到的实时响应阶段，响应完成后更新；缺少数据的值留空。自动更新仅信任 `Nemoyuzx/codex-usage-badge` 的发布包。
 
 ## 原图标自动加载（Windows 0.10.1 预发布）
 

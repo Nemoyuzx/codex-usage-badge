@@ -32,6 +32,7 @@ const sandbox = {
   unavailableValue: current => ({ ...current, stale: true }),
   installUsageBadge: noop, installProjectColors: noop, installProjectSizes: noop, installThreadTokens: noop,
   installThreadMetrics: noop,
+  createThreadPerformanceTracker: noop, installThreadPerformanceMonitor: noop,
   buildBootstrapScript: noop, formatRateLimits: noop, mergeRateLimitsResponse: noop, isMainWindow: noop
 };
 // log() constructs Date; expose both a real constructor and the controlled now().

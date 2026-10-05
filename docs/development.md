@@ -42,7 +42,13 @@ Token 读取本机会话数据库中的累计值，包含缓存输入，不代�
 
 本 fork 在输入框下方新增指标条，约每 5 秒刷新当前可见的本地 Codex 会话。`src/thread-metrics-ui.js` 通过可见的 thread composer 和它的 conversation ID 识别当前会话，云端、ChatGPT 与远程会话不读取本机同名数据。`src/thread-metrics-reader.js` 只读最新 `state_*.sqlite` 的会话 ID/rollout 路径，再分批读取本地 JSONL；渲染器只收到该窗口当前会话的数值汇总。
 
-指标定义：轮数来自有唯一 turn ID 的任务开始/完成事件；步数来自完成的模型响应记录，按 response ID 去重。旧版日志的步数通过去重后的累计 Token 记录推断。工具耗时来自同一 call ID 的工具调用与返回时间戳，重叠区间合并，因此包含工具等待时间。首 token 平均为已完成轮次记录的 `time_to_first_token_ms` 均值。缓存命中率是累计缓存输入 Token / 累计输入 Token，输入/输出是日志报告的会话累计值，包含推理输出。优先使用新版 `token_usage_record`，旧记录按支持的事件退化；缺失或尚未扫描完整的计数/耗时留空，不以部分历史冒充完整统计。LLM 总耗时和输出速率暂无可靠模型请求计时，留空。
+历史指标定义：轮数来自有唯一 turn ID 的任务开始/完成事件；步数来自完成的模型响应记录，按 response ID 去重。旧版日志的步数通过去重后的累计 Token 记录推断。工具耗时来自同一 call ID 的工具调用与返回时间戳，重叠区间合并，因此包含工具等待时间。首 token 平均为已完成轮次记录的 `time_to_first_token_ms` 均值。缓存命中率是累计缓存输入 Token / 累计输入 Token，输入/输出是日志报告的会话累计值，包含推理输出。优先使用新版 `token_usage_record`，旧记录按支持的事件退化；缺失或尚未扫描完整的计数/耗时留空，不以部分历史冒充完整统计。
+
+实时监测通过 `src/thread-performance-ui.js` 被动监听预加载层向窗口分发的 `mcp-notification`：只接受原生来源（`source === null`、空 origin）、Electron 客户端和 `hostId === 'local'`，将生命周期 ID/类型/数值投影给可独立测试的 `createThreadPerformanceTracker`。不订阅新的推理、不改变客户端原有处理器。当前客户端主动禁用了 `rawResponse/completed` 通知，而且转发时未保留 `emittedAtMs`，因此不能当作严格的服务端生成测速。
+
+`≈tok/s` 的每个有效样本使用 `thread/tokenUsage/updated.tokenUsage.last.outputTokens`，包含推理输出和工具参数。分母为本次响应最早完整观测的模型 item `startedAtMs` 至用量通知到达的时间，扣除其中可确认的工具执行时间并集；前端按最近 5 个有效样本的 `sum(outputTokens) / sum(durationMs) * 1000` 显示加权速率。它包含该观测阶段内的等待和通知传输/调度延迟，不包含首个模型 item 之前的时间，也不代表逐 Token 的瞬时生成速度。`≈LLM` 是当前有效监测时段内通过校验的响应阶段耗时累计，不与旧会话历史混加。提示中显示监测起点、最近样本时间和有效响应数。
+
+中途安装先等首个用量通知建立基线，之后捕获完整响应即可采样。重复用量、缺失推理生命周期、过时事件、无法分离的模型/工具重叠、计数回退等均不新增样本；普通不完整响应保留此前的有效均速，连接/可见性中断及重放/异常连续性会清空相应监测窗口。历史首 token 平均仍使用显式日志计时，不以 item 起点冒充 TTFT。更改 tracker 工厂或监听器时同步递增监听器版本，确保已有窗口重新安装正确代码。
 
 本 fork 的更新器与构建清单固定指向 `Nemoyuzx/codex-usage-badge`。从上游合并更新时保留此来源，否则上游发布包会移除 fork 功能。
 

@@ -33,6 +33,7 @@ try {
     RendererInjector:class {constructor(){this.sessions=new Map();}async scan(){} stop(){stopped++;}},
     AppServerClient:class{},ThreadTokenReader:class{},refreshThreadTokens:async()=>{},resolveCodexBin:()=> 'fixture',
     ThreadMetricsReader:class{},installThreadMetrics:noop,
+    createThreadPerformanceTracker:noop,installThreadPerformanceMonitor:noop,
     unavailableValue:v=>v,installUsageBadge:noop,installProjectColors:noop,installThreadTokens:noop,installProjectSizes:noop,ProjectSizeScanner:class{stop(){}},refreshProjectSizes:noop,measureDirectory:noop,measureDirectoryPortable:noop,measureProjectRoots:noop,
     buildBootstrapScript:noop,formatRateLimits:noop,mergeRateLimitsResponse:noop,isMainWindow:noop
   };

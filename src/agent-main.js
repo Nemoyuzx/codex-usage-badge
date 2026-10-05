@@ -157,6 +157,7 @@ async function main() {
 }
 module.exports = { installUsageBadge, installProjectColors, installProjectSizes, installThreadTokens, ThreadTokenReader, refreshThreadTokens,
   installThreadMetrics, ThreadMetricsReader, refreshThreadMetrics,
+  createThreadPerformanceTracker, installThreadPerformanceMonitor,
   ProjectSizeScanner, measureDirectory, measureDirectoryPortable, measureProjectRoots, refreshProjectSizes,
   buildBootstrapScript, formatRateLimits, mergeRateLimitsResponse, isMainWindow, resolveCodexBin, AppServerClient, main };
 if (require.main === module) main().catch(error => { log(`agent 启动失败：${error.message}`); process.exitCode = 1; });

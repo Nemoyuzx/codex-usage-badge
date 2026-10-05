@@ -1,5 +1,5 @@
 function installThreadMetrics() {
-  const VERSION = 1;
+  const VERSION = 2;
   const KEY = '__codexThreadMetrics';
   const MARK = 'data-codex-thread-metrics';
   const ROOT = '[data-codex-composer-root][data-composer-placement="thread"]';
@@ -115,19 +115,34 @@ function installThreadMetrics() {
     const stale = Number.isFinite(snapshot.checkedAt) && Date.now() - snapshot.checkedAt > 30000;
     const metric = threadId && snapshot.ok && !stale && Object.hasOwn(snapshot.perThread, threadId)
       ? snapshot.perThread[threadId] : null;
+    let measured = null;
+    if (threadId) try {
+      const monitor = window.__codexThreadPerformance;
+      const health = monitor?.status?.();
+      const candidate = health?.supported === true && health.active === true && health.connected === true ? monitor.snapshot(threadId) : null;
+      if (candidate?.timingApproximate === true && Number.isSafeInteger(candidate.observedResponses) && candidate.observedResponses > 0 &&
+        nonnegative(candidate.observedSince) && nonnegative(candidate.lastSampleAt) &&
+        candidate.lastSampleAt >= candidate.observedSince && candidate.lastSampleAt <= Date.now() + 1000) measured = candidate;
+    } catch { /* A missing or replaced monitor leaves only the file-backed values. */ }
     let available = 0;
     for (const [field, span] of values) {
-      const text = formatters[field](metric?.[field]);
+      const live = measured && ['llmDurationMs', 'tokensPerSecond'].includes(field) && nonnegative(measured[field]);
+      const formatted = formatters[field](live ? measured[field] : metric?.[field]);
+      const approximate = live || metric?.timingApproximate === true && ['llmDurationMs', 'tokensPerSecond'].includes(field);
+      const text = formatted && approximate ? `≈${formatted}` : formatted;
       if (span.textContent !== text) span.textContent = text;
       if (text) available++;
     }
-    const state = stale ? 'stale' : available ? 'ready' : 'unknown';
+    const state = available ? 'ready' : stale ? 'stale' : 'unknown';
     if (strip.dataset.state !== state) strip.dataset.state = state;
     const id = threadId ?? '';
     if (strip.dataset.threadId !== id) strip.dataset.threadId = id;
-    const reason = stale ? '数据已过期，等待重新连接。' : !metric ? '此会话暂无可读取的本地指标。' :
+    const reason = measured && !metric ? '当前会话的实时观测独立更新；本地累计记录暂不可读取。' :
+      stale ? '数据已过期，等待重新连接。' : !metric ? '此会话暂无可读取的本地指标。' :
       metric.complete === false ? '本地记录不完整；无法确认的指标留空。' : '来自当前会话的本地会话记录；无法读取的指标留空。';
-    const description = `${reason}\n轮数：开始的会话轮次。步数：已完成的模型响应数。\n工具调用：已配对工具调用的时间戳间隔（包括等待），并行区间合并。\n首 token：已完成轮次显式记录的首 token 延迟均值。缓存命中：缓存输入 Token / 输入 Token。`;
+    const timing = '\nLLM：本次有效监测时段完整观测响应阶段的累计耗时，不回算历史。\n≈tok/s：客户端实测响应阶段均速，含推理/工具参数和通知延迟，扣除可观测的工具执行间隔；最近5次有效完整观测，非严格服务端生成速度。';
+    const sample = measured ? `\n监测时段开始 ${new Date(measured.observedSince).toLocaleString('zh-CN')}；已完整观测 ${measured.observedResponses} 次响应。\n最近样本 ${new Date(measured.lastSampleAt).toLocaleString('zh-CN')}。` : '';
+    const description = `${reason}\n轮数：开始的会话轮次。步数：已完成的模型响应数。\n工具调用：已配对工具调用的时间戳间隔（包括等待），并行区间合并。\n首 token：已完成轮次显式记录的首 token 延迟均值。缓存命中：缓存输入 Token / 输入 Token。${timing}${sample}`;
     if (strip.title !== description) strip.title = description;
   }
   function refresh() {
