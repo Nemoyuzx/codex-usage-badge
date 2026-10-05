@@ -150,18 +150,20 @@ async function select(page, name) {
     assert.match(await page.locator(MARK).textContent(), /首 token 平均/);
     assert.match(await page.locator(MARK).textContent(), /缓存命中/);
     await update(page, { [B]: metrics }, Date.now() - 31000);
-    await assertBlank(page);
-    assert.equal(await page.locator(MARK).getAttribute('data-state'), 'stale');
+    assert.equal((await metricValues(page)).rounds, '9', 'an older response must not overwrite the latest known values');
     await update(page, { [B]: metrics }, Date.now(), false);
-    await assertBlank(page);
+    assert.equal((await metricValues(page)).rounds, '9');
+    assert.equal(await page.locator(MARK).getAttribute('data-state'), 'cached');
+    assert.match(await page.locator(MARK).getAttribute('title'), /保留上次已知数值/);
     await update(page, { [B]: metrics });
+    const lastGood = await metricValues(page);
     await update(page, {});
-    await assertBlank(page);
+    assert.deepEqual(await metricValues(page), lastGood, 'missing fields must retain the previous complete snapshot');
 
     // Invalid values must not become zero, NaN, an invented percent or a string.
     await update(page, { [B]: { rounds: -1, steps: 1.2, llmDurationMs: '1000', toolDurationMs: -100,
       firstTokenAvgMs: 'no', tokensPerSecond: -2, cacheHitPercent: 101, inputTokens: 1.1, outputTokens: null } });
-    await assertBlank(page);
+    assert.deepEqual(await metricValues(page), lastGood, 'invalid fields must retain known values without inventing replacements');
     await update(page, { [B]: { ...metrics, complete: false } });
     assert.match(await page.locator(MARK).getAttribute('title'), /本地记录不完整/);
     await update(page, { [B]: { ...metrics, timingApproximate: true } });
@@ -174,7 +176,8 @@ async function select(page, name) {
         el.setAttribute('data-above-composer-conversation-id', id), id);
       await update(page, { [id]: metrics, [B]: metrics });
       await assertBlank(page);
-      assert.deepEqual(await page.evaluate(() => window.__codexThreadMetrics.requestedIds()), [], 'only explicitly local threads may be requested');
+      assert.deepEqual(await page.evaluate(() => window.__codexThreadMetrics.requestedIds()), id === UNKNOWN ? [UNKNOWN] : [],
+        'unproven candidates may be verified by the backend; explicit remote/cloud threads cannot be requested');
     }
     // Sidebar selection does not override a conflicting composer identity.
     await page.locator('[data-page="b"] [data-above-composer-conversation-id]').evaluate((el, id) => {
@@ -203,6 +206,126 @@ async function select(page, name) {
     await page.evaluate(() => document.body.append(document.createElement('div')));
     await page.waitForTimeout(150);
     assert.equal(await page.locator(MARK).count(), 0, 'destroyed installer must not recreate itself');
+    const actor = 'a'.repeat(64), otherActor = 'b'.repeat(64), localScope = 'c'.repeat(64), homeScope = 'd'.repeat(64), revision = 'e'.repeat(64);
+    await page.route('http://metrics-fixture.test/**', route => route.fulfill({ contentType: 'text/html', body: fixture }));
+    await page.goto('http://metrics-fixture.test/');
+    async function actorState(scopeId, reason = 'verified', pending = false) {
+      await page.evaluate(state => {
+        window.accountFixture = state;
+        window.__codexThreadMetricsAccount = { snapshot: () => window.accountFixture };
+        window.__codexThreadMetrics?.refresh();
+      }, { scopeId, reason, pending, supported: true, checkedAt: Date.now(), changeEpoch: 1 });
+    }
+    await actorState(actor);
+    await page.evaluate(`(${installThreadMetrics.toString()})()`);
+    const verified = (data = metrics, extra = {}) => ({ ...data, scopeId: localScope, localVerified: true, revision,
+      rolloutSize: 100, rolloutMtimeMs: 1, complete: true, ...extra });
+    async function verifiedUpdate(perThread, persistedPerThread = {}) {
+      await page.evaluate(data => window.__codexThreadMetrics.update(data),
+        { ok: true, checkedAt: Date.now(), scopeId: homeScope, perThread, persistedPerThread });
+    }
+    await verifiedUpdate({ [A]: verified(), [B]: verified({ ...metrics, rounds: 7, steps: 99 }) });
+    const savedA = await metricValues(page);
+    await select(page, 'b');
+    assert.equal((await metricValues(page)).rounds, '7');
+    await select(page, 'a');
+    assert.deepEqual(await metricValues(page), savedA, 'switching back restores every collected field');
+    await verifiedUpdate({ [A]: verified({ rounds: null, steps: 2 }, { complete: false, countersLowerBound: true, stepsComplete: false }) });
+    assert.equal((await metricValues(page)).rounds, '1');
+    assert.equal((await metricValues(page)).steps, '52', 'partial counts cannot overwrite a greater complete historical count');
+    await verifiedUpdate({ [A]: verified({ rounds: 1 }, { complete: false, countersLowerBound: true, roundsComplete: true, stepsComplete: false }) });
+    assert.equal((await metricValues(page)).rounds, '1', 'an indexed complete round count overrides the partial-history flag');
+    await page.evaluate(() => window.__codexThreadMetrics.update({ ok: false, checkedAt: Date.now(), scopeId: 'd'.repeat(64), perThread: {} }));
+    assert.deepEqual(await metricValues(page), savedA);
+    assert.equal(await page.locator(MARK).getAttribute('data-state'), 'cached');
+    assert.match(await page.locator(MARK + ' [data-metric="steps"]').getAttribute('title'), /保留的历史数值/);
+    for (let i = 0; i < 3; i++) await page.evaluate(`(${installThreadMetrics.toString()})()`);
+    assert.deepEqual(await metricValues(page), savedA, 'reinjection preserves per-thread history');
+    const pending = await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots());
+    assert.equal(pending.length, 2);
+    assert.equal(pending.every(value => value.actorScopeId === actor && value.scopeId === localScope), true);
+    await page.evaluate(records => window.__codexThreadMetrics.ackPersisted(records.map(record => ({ ...record, pendingVersion: record.pendingVersion - 1 }))), pending);
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots().length), 2, 'stale acknowledgements cannot drop dirty snapshots');
+    await page.evaluate(records => window.__codexThreadMetrics.ackPersisted(records.map(record => ({ ...record, producerId: '00000000-0000-0000-0000-000000000099' }))), pending);
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots().length), 2, 'an acknowledgement from another renderer cannot drop current snapshots');
+    await page.evaluate(records => window.__codexThreadMetrics.ackPersisted(records), pending);
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots().length), 0);
+    await actorState(actor, 'verified', true);
+    assert.deepEqual(await metricValues(page), savedA, 'periodic actor revalidation preserves last-known fields');
+    assert.equal(await page.locator(MARK).getAttribute('data-state'), 'cached');
+    await actorState(actor);
+
+    const background = '00000000-0000-0000-0000-000000000090';
+    await page.evaluate(({ a, b }) => {
+      const since = Date.now();
+      window.__codexThreadPerformance = { status: () => ({ supported: true, active: true, connected: true }),
+        snapshot: id => id === a || id === b ? null : ({ llmDurationMs: 500, tokensPerSecond: 120, timingApproximate: true,
+          observedSince: since, observedResponses: 2, lastSampleAt: since,
+          observedRounds: 4, observedSteps: 6, countersLowerBound: true,
+          countersObservedSince: since, countersUpdatedAt: since, privatePrompt: 'PRIVATE' }), reset() {} };
+    }, { a: A, b: B });
+    await page.evaluate(id => window.__codexThreadMetrics.captureThread(id), background);
+    assert.equal((await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots())).some(value => value.threadId === background), false,
+      'background samples await fresh local provenance before they can be persisted');
+    await verifiedUpdate({ [background]: verified({}, { complete: false }) });
+    assert.equal((await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots())).some(value => value.threadId === background), true,
+      'known-local background samples are saved even before their input is visible');
+    assert.equal(JSON.stringify(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots())).includes('PRIVATE'), false);
+    const observed = Array.from({ length: 12 }, (_, index) => `00000000-0000-0000-0000-${String(index + 80).padStart(12, '0')}`);
+    await page.evaluate(ids => ids.forEach(id => window.__codexThreadMetrics.captureThread(id)), observed);
+    const requested = new Set();
+    for (let i = 0; i < 4; i++) for (const id of await page.evaluate(() => window.__codexThreadMetrics.requestedIds())) requested.add(id);
+    assert.equal(observed.every(id => requested.has(id)), true, 'bounded rotating verification batches cannot starve background conversations');
+    await page.evaluate(() => delete window.__codexThreadPerformance);
+
+    // The DOM can use a client-new-thread alias or omit a collapsed sidebar row.
+    // Current backend proof, rather than a persisted host flag, resolves it.
+    await page.locator('[data-app-action-sidebar-thread-id]').first().evaluate(element => element.setAttribute('data-app-action-sidebar-thread-id', 'local:client-new-thread:alias'));
+    await page.evaluate(() => window.__codexThreadMetrics.refresh());
+    assert.equal((await metricValues(page)).rounds, '1');
+    await page.reload();
+    await actorState(actor);
+    await page.evaluate(`(${installThreadMetrics.toString()})()`);
+    await verifiedUpdate({ [A]: verified({}, { complete: false }) });
+    assert.deepEqual(await metricValues(page), savedA, 'reload restores numeric history under matching actor/local provenance');
+    assert.equal(await page.locator(MARK).getAttribute('data-state'), 'cached');
+    assert.equal(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots().length), 1, 'local-storage restoration remains dirty until the durable store acknowledges it');
+    const restored = await page.evaluate(id => {
+      const { pendingVersion, producerId, ...record } = window.__codexThreadMetrics.pendingSnapshots().find(record => record.threadId === id);
+      return record;
+    }, A);
+    await actorState(null, 'connection-change', true);
+    assert.deepEqual(await metricValues(page), savedA, 'ordinary disconnected identity checks retain renderer history');
+    await actorState(null, 'account-change', true);
+    await assertBlank(page);
+    await actorState(otherActor);
+    await verifiedUpdate({ [A]: verified({}, { complete: false }) });
+    await assertBlank(page);
+    assert.equal((await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots())).some(value => value.actorScopeId === actor), true,
+      'old-account dirty snapshots remain independently flushable after switching account');
+    await actorState(actor);
+    await page.evaluate(({ actor, localScope, id }) => localStorage.removeItem(`codex-usage-badge.thread-metrics.v1:${actor}:${localScope}:${id}`), { actor, localScope, id: A });
+    await verifiedUpdate({ [A]: verified({}, { complete: false }) }, { [A]: restored });
+    assert.deepEqual(await metricValues(page), savedA, 'matching durable-store history restores after returning to the original actor');
+    const newer = structuredClone(restored);
+    newer.fields.tokensPerSecond = { value: 350, at: Date.now(), source: 'monitor', approximate: true, lowerBound: false,
+      observedSince: Date.now() - 1000, observedResponses: 1 };
+    newer.updatedAt = newer.fields.tokensPerSecond.at;
+    await verifiedUpdate({ [A]: verified({}, { complete: false }) }, { [A]: newer });
+    assert.equal((await metricValues(page)).tokensPerSecond, '≈350', 'newer canonical fields replace stale memory/local-storage values');
+
+    // All collected conversations remain saved; there is no persistent 64-row eviction.
+    const many = Object.fromEntries(Array.from({ length: 70 }, (_, index) =>
+      [`00000000-0000-0000-0000-${String(index + 100).padStart(12, '0')}`, verified({ rounds: index + 1, inputTokens: 10 })]));
+    await verifiedUpdate(many);
+    assert.ok(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('codex-usage-badge.thread-metrics.v1:')).length) >= 72);
+    assert.ok(await page.evaluate(() => window.__codexThreadMetrics.pendingSnapshots().length) >= 70);
+    await verifiedUpdate({ [A]: verified({ rounds: 2 }, { revision: 'f'.repeat(64), rolloutSize: 20, rolloutMtimeMs: 2 }) });
+    assert.equal((await metricValues(page)).rounds, '2');
+    assert.equal((await metricValues(page)).steps, '', 'actual rollout replacement clears values from the old revision');
+    await page.evaluate(() => { localStorage.setItem('unrelated-setting', 'keep'); window.__codexThreadMetrics.destroy({ clearStorage: true }); });
+    assert.equal(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith('codex-usage-badge.thread-metrics.v1:'))), false);
+    assert.equal(await page.evaluate(() => localStorage.getItem('unrelated-setting')), 'keep');
     console.log('PASS Thread metrics footer: live composer structure, both themes, narrow layout, preserved input controls, local identity, kept-alive page switching, blanks/staleness, reinjection, observer loops and cleanup');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

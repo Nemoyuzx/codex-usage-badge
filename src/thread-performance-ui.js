@@ -1,5 +1,5 @@
 function installThreadPerformanceMonitor(createTracker) {
-  const VERSION = 2;
+  const VERSION = 3;
   const KEY = '__codexThreadPerformance';
   if (window[KEY]?.version === VERSION) return;
   window[KEY]?.destroy?.();
@@ -20,6 +20,12 @@ function installThreadPerformanceMonitor(createTracker) {
   let notifications = 0;
   let failures = 0;
   let lastNotificationAt = null;
+  const trackedIds = new Set();
+  function captureThread(id) {
+    try { window.__codexThreadMetrics?.captureThread?.(id); } catch {}
+  }
+  function captureAll() { for (const id of trackedIds) captureThread(id); }
+  function clearMeasurements() { tracker.reset(); trackedIds.clear(); }
   const timestamp = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
   const identifier = value => typeof value === 'string' && value.length <= 256 && /^[a-z0-9_.:-]+$/i.test(value);
   function tokenCounts(source) {
@@ -62,6 +68,7 @@ function installThreadPerformanceMonitor(createTracker) {
       if (message.type === 'mcp-notification' &&
         (message.isSnapshot === true || message.isReplay === true || message.replay === true)) {
         const id = message.params?.threadId;
+        if (typeof id === 'string' && UUID.test(id)) captureThread(id); else captureAll();
         tracker.reset(typeof id === 'string' && UUID.test(id) ? id : undefined);
         window.__codexThreadMetrics?.refresh?.();
         return;
@@ -71,7 +78,7 @@ function installThreadPerformanceMonitor(createTracker) {
         // native status messages do not establish a new measurement window.
         if (CONNECTION_STATES.has(message.state)) {
           const next = message.state === 'connected';
-          if (next !== connected) tracker.reset();
+          if (next !== connected) { captureAll(); clearMeasurements(); }
           connected = next;
           window.__codexThreadMetrics?.refresh?.();
         }
@@ -80,9 +87,19 @@ function installThreadPerformanceMonitor(createTracker) {
       if (!connected || paused || message.type !== 'mcp-notification') return;
       const record = project(message);
       if (!record) return;
+      const id = record.params.threadId;
+      // Persist a thread's last known values before an epoch reset or LRU
+      // eviction, including conversations whose composer is not in view.
+      if (!trackedIds.has(id) && trackedIds.size >= 16) {
+        const oldest = trackedIds.values().next().value;
+        captureThread(oldest); trackedIds.delete(oldest);
+      }
+      trackedIds.delete(id); trackedIds.add(id);
+      captureThread(id);
       const receivedAt = Date.now();
       tracker.record(record, receivedAt);
       lastNotificationAt = receivedAt; notifications++;
+      captureThread(id);
     } catch {
       // An unsupported native payload must not interrupt the app's own
       // notification listeners or log any sensitive message contents.
@@ -91,7 +108,7 @@ function installThreadPerformanceMonitor(createTracker) {
   }
   function onVisibility() {
     const next = document.hidden;
-    if (paused !== next) { tracker.reset(); paused = next; window.__codexThreadMetrics?.refresh?.(); }
+    if (paused !== next) { captureAll(); clearMeasurements(); paused = next; window.__codexThreadMetrics?.refresh?.(); }
   }
   if (supported) {
     window.addEventListener('message', onMessage);
@@ -101,12 +118,16 @@ function installThreadPerformanceMonitor(createTracker) {
   window[KEY] = {
     version: VERSION,
     snapshot(id) { return !disposed && supported && connected && !paused && typeof id === 'string' && UUID.test(id) ? tracker.snapshot(id) : null; },
+    reset(id) {
+      if (typeof id === 'string' && UUID.test(id)) { tracker.reset(id); trackedIds.delete(id); }
+      else clearMeasurements();
+    },
     status() { return { version: VERSION, supported, active: !disposed && supported && !paused, connected, paused,
       source: 'native-local-notifications', notifications, failures, lastNotificationAt, tracker: tracker.status() }; },
     destroy() {
       disposed = true; window.removeEventListener('message', onMessage);
       document.removeEventListener('visibilitychange', onVisibility); window.removeEventListener('focus', onVisibility);
-      tracker.stop();
+      trackedIds.clear(); tracker.stop();
       if (window[KEY] === this) delete window[KEY];
     }
   };

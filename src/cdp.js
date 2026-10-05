@@ -6,7 +6,7 @@ function isMainWindow(target) {
 }
 function buildBootstrapScript() {
   const monitor = `(${installThreadPerformanceMonitor.toString()})(${createThreadPerformanceTracker.toString()})`;
-  return [monitor, ...[installUsageBadge,installProjectColors,installProjectSizes,installThreadTokens,installThreadMetrics].map(fn=>`(${fn.toString()})()`)].join(';\n');
+  return [`(${installThreadMetricsAccountScope.toString()})()`, monitor, ...[installUsageBadge,installProjectColors,installProjectSizes,installThreadTokens,installThreadMetrics].map(fn=>`(${fn.toString()})()`)].join(';\n');
 }
 class CdpSession {
   constructor(target) {this.target=target;this.pending=new Map();this.serial=0;this.socket=null;}

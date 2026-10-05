@@ -3,7 +3,7 @@
 function createThreadPerformanceTracker({
   now = () => Date.now(), maxThreads = 16, maxItems = 500,
   recentResponses = 5, maxGapMs = 300000, maxWindowMs = 1800000,
-  clockToleranceMs = 2000,
+  clockToleranceMs = 2000, maxCounterEvents = 10000,
 } = {}) {
   const threads = new Map();
   let observedSince = now(), stopped = false;
@@ -17,9 +17,10 @@ function createThreadPerformanceTracker({
   const newState = (at, turnId = null) => ({ observedSince: at, turnId, closed: false, capturedTurn: false,
     baseline: null, pending: null, items: new Map(), duration: 0, responses: 0, samples: [],
     lastSampleAt: null, lastEventAt: at, lastBoundary: null, lastModelEnd: null,
-    lastBatchIds: new Set(), invalidWindow: false });
+    lastBatchIds: new Set(), invalidWindow: false, counterRoundIds: new Set(), counterStepKeys: new Set(), countersUpdatedAt: null, countersObservedSince: at });
   const empty = at => ({ llmDurationMs: null, tokensPerSecond: null, timingApproximate: true,
-    observedSince: at, observedResponses: 0, lastSampleAt: null });
+    observedSince: at, observedResponses: 0, lastSampleAt: null,
+    observedRounds: null, observedSteps: null, countersScope: 'since-monitor-start', countersLowerBound: true, countersUpdatedAt: null, countersObservedSince: at });
 
   function clearWindow(state, clearRate = true) {
     state.pending = null; state.items.clear(); state.baseline = null;
@@ -34,8 +35,13 @@ function createThreadPerformanceTracker({
     while (threads.size > Math.max(1, maxThreads)) threads.delete(threads.keys().next().value);
     return state;
   }
-  function restart(threadId, at, turnId = null) {
+  function restart(threadId, at, turnId = null, preserveCounters = true) {
+    const previous = threads.get(threadId);
     const state = newState(at, turnId);
+    if (previous && preserveCounters) {
+      state.counterRoundIds = previous.counterRoundIds; state.counterStepKeys = previous.counterStepKeys;
+      state.countersUpdatedAt = previous.countersUpdatedAt; state.countersObservedSince = previous.countersObservedSince;
+    }
     threads.delete(threadId); threads.set(threadId, state);
     return state;
   }
@@ -85,6 +91,24 @@ function createThreadPerformanceTracker({
     if (state.turnId !== turnId) {
       // Ordinary turn changes preserve the sum of validated observed windows.
       clearWindow(state); state.turnId = turnId; state.closed = false;
+    }
+    // Counters describe observed native lifecycle events, independently of
+    // whether response timing was complete enough to accept a speed sample.
+    if ((method === 'turn/started' || method === 'turn/completed') && !state.counterRoundIds.has(turnId)
+      && state.counterRoundIds.size < Math.max(1, maxCounterEvents)) {
+      state.counterRoundIds.add(turnId); state.countersUpdatedAt = receivedAt;
+    }
+    if (method === 'thread/tokenUsage/updated') {
+      const total = params.tokenUsage?.total;
+      if (total && integer(total.inputTokens) && integer(total.outputTokens) && (total.inputTokens > 0 || total.outputTokens > 0)) {
+        // Cache/reasoning detail can be absent on an otherwise mirrored event.
+        // Cumulative input/output are sufficient to identify progress and avoid
+        // recounting one completion when optional metadata changes shape.
+        const key = `${total.inputTokens}:${total.outputTokens}`;
+        if (!state.counterStepKeys.has(key) && state.counterStepKeys.size < Math.max(1, maxCounterEvents)) {
+          state.counterStepKeys.add(key); state.countersUpdatedAt = receivedAt;
+        }
+      }
     }
     if (method === 'turn/started') {
       if (!state.capturedTurn) {
@@ -209,13 +233,16 @@ function createThreadPerformanceTracker({
     return { llmDurationMs: state.responses ? state.duration : null,
       tokensPerSecond: durations > 0 ? tokens / durations * 1000 : null,
       timingApproximate: true, observedSince: state.observedSince,
-      observedResponses: state.responses, lastSampleAt: state.lastSampleAt };
+      observedResponses: state.responses, lastSampleAt: state.lastSampleAt,
+      observedRounds: state.counterRoundIds.size || null, observedSteps: state.counterStepKeys.size || null,
+      countersScope: 'since-monitor-start', countersLowerBound: true, countersUpdatedAt: state.countersUpdatedAt,
+      countersObservedSince: state.countersObservedSince };
   }
   function reset(threadId) {
     if (stopped) return;
     const at = now();
     if (threadId === undefined) { threads.clear(); observedSince = at; }
-    else if (uuid(threadId)) restart(threadId, at);
+    else if (uuid(threadId)) restart(threadId, at, null, false);
   }
   function stop() { stopped = true; threads.clear(); }
   function status() {

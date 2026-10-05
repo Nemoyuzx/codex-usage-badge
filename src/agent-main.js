@@ -1,20 +1,51 @@
 var AGENT_VERSION = '0.9.4';
-async function refreshThreadMetrics(injector, reader) {
+async function refreshThreadMetrics(injector, reader, store = null) {
   const sessions = [...injector.sessions.values()];
   if (!sessions.length) return;
   const requests = await Promise.all(sessions.map(async session => {
     try {
-      const result = await session.evaluate('window.__codexThreadMetrics?.requestedIds() ?? []');
-      const ids = result?.result?.value;
-      return { session, ids: Array.isArray(ids) ? ids.filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)).slice(0, 4) : [] };
-    } catch { return { session, ids: [] }; }
+      const result = await session.evaluate('(() => { const api = window.__codexThreadMetrics; return { ids: api?.requestedIds() ?? [], actorScopeId: api?.persistenceContext?.().actorScopeId ?? null, pending: api?.pendingSnapshots?.() ?? [] }; })()');
+      const raw = result?.result?.value;
+      const context = Array.isArray(raw) ? { ids: raw } : raw;
+      const ids = Array.isArray(context?.ids) ? context.ids.filter(id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)).slice(0, 32) : [];
+      const actorScopeId = typeof context?.actorScopeId === 'string' && /^[a-f0-9]{64}$/i.test(context.actorScopeId) ? context.actorScopeId : null;
+      const pending = Array.isArray(context?.pending) ? context.pending.slice(0, 256) : [];
+      return { session, ids, actorScopeId, pending };
+    } catch { return { session, ids: [], actorScopeId: null, pending: [] }; }
   }));
-  const snapshot = await reader.read(requests.flatMap(request => request.ids));
-  await Promise.all(requests.map(async ({ session, ids }) => {
+  if (store) for (const { session, pending } of requests) {
+    if (!pending.length) continue;
+    try {
+      // Acknowledge only committed versions. Newer observations remain queued
+      // if they arrive while the previous snapshot is being saved.
+      const accepted = await store.write(pending);
+      if (accepted.length) await session.evaluate(`window.__codexThreadMetrics?.ackPersisted(${JSON.stringify(accepted)})`);
+    } catch { /* Keep the renderer's pending values for a later retry. */ }
+  }
+  // Interleave requests so another window's active conversation is not starved
+  // by a first window's background candidates when the reader bounds its batch.
+  const requested = [];
+  for (let index = 0; index < Math.max(0, ...requests.map(request => request.ids.length)); index++) {
+    for (const request of requests) if (request.ids[index]) requested.push(request.ids[index]);
+  }
+  const snapshot = await reader.read([...new Set(requested)]);
+  await Promise.all(requests.map(async ({ session, ids, actorScopeId }) => {
     // Send aggregate numbers only, and only to the window that requested this thread.
     const perThread = Object.fromEntries(ids.filter(id => Object.hasOwn(snapshot.perThread, id)).map(id => [id, snapshot.perThread[id]]));
-    try { await session.evaluate(`window.__codexThreadMetrics?.update(${JSON.stringify({ ...snapshot, perThread })})`); } catch {}
+    const persistedPerThread = Object.create(null);
+    if (store && actorScopeId) for (const id of ids) {
+      const metric = perThread[id];
+      if (metric?.localVerified !== true || typeof metric.scopeId !== 'string' || !/^[a-f0-9]{64}$/i.test(metric.scopeId)) continue;
+      try {
+        const saved = await store.read({ actorScopeId, scopeId: metric.scopeId, threadId: id,
+          ...(typeof metric.revision === 'string' && /^[a-f0-9]{64}$/i.test(metric.revision) ? { revision: metric.revision } : {}) });
+        if (saved) persistedPerThread[id] = saved;
+      } catch {}
+    }
+    const payload = store ? { ...snapshot, perThread, persistedPerThread } : { ...snapshot, perThread };
+    try { await session.evaluate(`window.__codexThreadMetrics?.update(${JSON.stringify(payload)})`); } catch {}
   }));
+  return snapshot;
 }
 function parseArgs(argv) {
   const options = {
@@ -43,6 +74,7 @@ async function main() {
   const injector = new RendererInjector({ port: options.port, debug: options.debug, scanIntervalMs: 5000 });
   const tokenReader = new ThreadTokenReader();
   const metricsReader = new ThreadMetricsReader();
+  const metricsStore = new ThreadMetricsStore();
   const projectSizeScanner = new ProjectSizeScanner();
   let stopped = false;
   let client = null;
@@ -51,6 +83,8 @@ async function main() {
   let failures = 0;
   let connected = false;
   let refreshingProjectSizes = false;
+  let refreshingMetrics = false;
+  let nextMetricsRead = 0;
   injector.currentValue = { percent: null, title: '正在读取 Codex 剩余用量', tone: 'muted', windowLabel: '' };
   // A missing port is an idle state, never a reason to restart or focus the app.
   const scan = async () => {
@@ -118,12 +152,24 @@ async function main() {
     finally { refreshingProjectSizes = false; }
   };
   projectSizeScanner.onChange = () => { updateProjectSizes().catch(() => {}); };
+  const updateMetrics = async () => {
+    if (stopped || refreshingMetrics || injector.sessions.size === 0 || Date.now() < nextMetricsRead) return;
+    refreshingMetrics = true;
+    try {
+      const result = await refreshThreadMetrics(injector, metricsReader, metricsStore);
+      // Continue bounded local backfill promptly; an idle/complete reader keeps
+      // the normal five-second cadence. Window scans and quota reads stay separate.
+      nextMetricsRead = Date.now() + (result?.backfilling === true ? 200 : 5000);
+    } catch {
+      nextMetricsRead = Date.now() + 5000;
+    } finally { refreshingMetrics = false; }
+  };
   const tick = async () => {
     await scan();
     // Quota requests can wait on the network; pending prevents overlap without delaying local reads.
     readUsage().catch(error => { if (!stopped) log(`额度刷新暂不可用：${error.message}`); });
     await refreshThreadTokens(injector, tokenReader);
-    await refreshThreadMetrics(injector, metricsReader);
+    await updateMetrics();
     await updateProjectSizes();
   };
   let ticking = false;
@@ -134,14 +180,17 @@ async function main() {
     finally { ticking = false; }
   };
   const timer = setInterval(guardedTick, 5000);
+  const metricsTimer = setInterval(() => { updateMetrics().catch(() => {}); }, 200);
   let stopTimer = null;
   const shutdown = () => {
     stopped = true;
     clearInterval(timer);
+    clearInterval(metricsTimer);
     if (stopTimer) clearInterval(stopTimer);
     const old = client; client = null; old?.stop();
     projectSizeScanner.stop();
     metricsReader.stop?.();
+    metricsStore.stop?.();
     injector.stop();
     process.exit(0);
   };
@@ -158,6 +207,8 @@ async function main() {
 module.exports = { installUsageBadge, installProjectColors, installProjectSizes, installThreadTokens, ThreadTokenReader, refreshThreadTokens,
   installThreadMetrics, ThreadMetricsReader, refreshThreadMetrics,
   createThreadPerformanceTracker, installThreadPerformanceMonitor,
+  installThreadMetricsAccountScope,
+  ThreadMetricsStore,
   ProjectSizeScanner, measureDirectory, measureDirectoryPortable, measureProjectRoots, refreshProjectSizes,
   buildBootstrapScript, formatRateLimits, mergeRateLimitsResponse, isMainWindow, resolveCodexBin, AppServerClient, main };
 if (require.main === module) main().catch(error => { log(`agent 启动失败：${error.message}`); process.exitCode = 1; });

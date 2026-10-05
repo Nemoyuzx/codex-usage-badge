@@ -25,6 +25,9 @@ class ThreadMetricsReader {
     this.maxTrackedEvents = Math.max(1, maxTrackedEvents);
     this.cache = new Map();
     this.pending = new Map();
+    this.scopeId = null;
+    this.scopeEpoch = 0;
+    this.provenance = new Map();
     this.stopped = false;
   }
 
@@ -46,9 +49,34 @@ class ThreadMetricsReader {
       const file = fs.readdirSync(this.home).filter(name => /^state_\d+\.sqlite$/.test(name))
         .sort((a, b) => Number(b.match(/\d+/)[0]) - Number(a.match(/\d+/)[0]))[0];
       if (!file) throw new Error('No state database');
+      const dbFile = path.join(this.home, file), stat = fs.statSync(dbFile);
+      const scopeId = require('node:crypto').createHash('sha256').update(`${fs.realpathSync(this.home)}\0${fs.realpathSync(dbFile)}\0${stat.dev}:${stat.ino}`).digest('hex');
+      if (this.scopeId !== scopeId) { this.cache.clear(); this.provenance.clear(); this.scopeId = scopeId; this.scopeEpoch++; }
       db = this.openDatabase(path.join(this.home, file), { readOnly: true, timeout: 200 });
-      return db.prepare(`SELECT id, rollout_path FROM threads WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+      const columns = db.prepare('PRAGMA table_info(threads)').all();
+      const owner = columns.some(column => column.name === 'creator_account_id');
+      const rows = db.prepare(`SELECT id, rollout_path${owner ? ', creator_account_id' : ''} FROM threads WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+      return rows.map(row => ({ id: row.id, rollout_path: row.rollout_path, scopeId: owner && typeof row.creator_account_id === 'string'
+        ? require('node:crypto').createHash('sha256').update(`${scopeId}\0${row.creator_account_id}`).digest('hex') : scopeId }));
     } finally { try { db?.close(); } catch {} }
+  }
+
+  indexedRounds(ids) {
+    const fs = require('node:fs'), path = require('node:path');
+    let db;
+    try {
+      const file = fs.readdirSync(this.home).filter(name => /^thread_history_\d+\.sqlite$/.test(name))
+        .sort((a, b) => Number(b.match(/\d+/)[0]) - Number(a.match(/\d+/)[0]))[0];
+      if (!file) return new Map();
+      db = this.openDatabase(path.join(this.home, file), { readOnly: true, timeout: 200 });
+      // Read only lifecycle identifiers/counts and projection watermarks; never
+      // item_json, error_json, messages or other conversation bodies.
+      const rows = db.prepare(`SELECT p.thread_id AS id, p.next_rollout_byte_offset AS offset, COUNT(DISTINCT t.turn_id) AS rounds
+        FROM thread_history_projection_state p LEFT JOIN thread_turns t ON t.thread_id = p.thread_id
+        WHERE p.thread_id IN (${ids.map(() => '?').join(',')}) GROUP BY p.thread_id, p.next_rollout_byte_offset`).all(...ids);
+      return new Map(rows.filter(row => Number.isSafeInteger(row.offset) && row.offset >= 0 && Number.isSafeInteger(row.rounds) && row.rounds >= 0).map(row => [row.id, row]));
+    } catch { return new Map(); }
+    finally { try { db?.close(); } catch {} }
   }
 
   async read(ids) {
@@ -58,22 +86,35 @@ class ThreadMetricsReader {
     if (this.stopped) return { ok: false, perThread, checkedAt };
     if (!requested.length) return { ok: true, perThread, checkedAt };
     let rows;
-    try { rows = this.paths(requested); } catch { return { ok: false, perThread, checkedAt }; }
+    try { rows = this.paths(requested); } catch {
+      // Declare a known new storage scope even when its schema is unsupported;
+      // the renderer must not attach an old database's cached values to it.
+      return { ok: false, perThread, checkedAt, scopeId: this.scopeId, backfilling: false };
+    }
+    const scopeEpoch = this.scopeEpoch, storageScopeId = this.scopeId;
+    const rounds = this.indexedRounds(requested);
+    let backfilling = false;
     // Sequential scans bound the total CPU and I/O budget for a refresh. Usually
     // only the current conversation is requested by each desktop window.
     for (const row of rows) {
       if (!requested.includes(row.id) || this.stopped) continue;
-      let pending = this.pending.get(row.id);
+      const pendingKey = `${storageScopeId}:${row.scopeId}:${row.id}:${row.rollout_path}`;
+      let pending = this.pending.get(pendingKey);
       if (!pending) {
-        pending = this.readThread(row.id, row.rollout_path).catch(() => this.empty());
-        this.pending.set(row.id, pending);
+        pending = this.readThread(row.id, row.rollout_path, rounds.get(row.id), scopeEpoch, storageScopeId).catch(() => this.empty());
+        this.pending.set(pendingKey, pending);
       }
-      try { perThread[row.id] = await pending; } finally {
-        if (this.pending.get(row.id) === pending) this.pending.delete(row.id);
+      try {
+        const result = await pending;
+        if (scopeEpoch !== this.scopeEpoch) return { ok: false, perThread: Object.create(null), checkedAt, scopeId: this.scopeId, backfilling: false };
+        perThread[row.id] = { ...result, localVerified: true, scopeId: row.scopeId };
+        if (perThread[row.id].backfilling) backfilling = true;
+      } finally {
+        if (this.pending.get(pendingKey) === pending) this.pending.delete(pendingKey);
       }
     }
     while (this.cache.size > this.maxCachedThreads) this.cache.delete(this.cache.keys().next().value);
-    return { ok: !this.stopped, perThread, checkedAt };
+    return { ok: !this.stopped, perThread, checkedAt, scopeId: this.scopeId, backfilling };
   }
 
   async safePath(file) {
@@ -99,7 +140,7 @@ class ThreadMetricsReader {
       roundIds: new Set(), responseIds: new Set(), legacySnapshots: new Set(), steps: 0,
       modern: false, totals: null, modernTotals: null, tailResult: null, tailSize: -1,
       firstTokens: new Map(), calls: new Map(), completedCalls: new Set(), intervals: [],
-      toolEvents: false,
+      toolEvents: false, lastGoodCounters: null, indexInvalidated: false,
     };
   }
 
@@ -143,7 +184,10 @@ class ThreadMetricsReader {
       if (state.ownSession) state.recognized = true;
       return;
     }
-    if (!state.ownSession || payload.thread_id && payload.thread_id !== id) return;
+    // Modern records carry explicit ownership even when a fork later appends
+    // inherited session metadata. Untagged legacy records still need metadata.
+    const ownUsage = record.type === 'token_usage_record' && payload.thread_id === id;
+    if (!ownUsage && (!state.ownSession || payload.thread_id && payload.thread_id !== id)) return;
     if (state.roundIds.size + state.responseIds.size + state.legacySnapshots.size + state.firstTokens.size
       + state.calls.size + state.completedCalls.size >= this.maxTrackedEvents) {
       // Exact event deduplication is necessary for totals. A pathological log
@@ -155,6 +199,7 @@ class ThreadMetricsReader {
     if (record.type === 'token_usage_record') {
       if (payload.thread_id !== id || typeof payload.response_id !== 'string' || !payload.response_id) return;
       state.recognized = true;
+      if (typeof payload.turn_id === 'string' && payload.turn_id) state.roundIds.add(payload.turn_id);
       const key = this.usageKey(payload.thread_token_usage);
       if (!state.responseIds.has(payload.response_id)) {
         // The first modern record can mirror the last legacy cumulative event.
@@ -272,21 +317,32 @@ class ThreadMetricsReader {
     return { found: false, totals: null };
   }
 
-  async readThread(id, originalFile) {
+  async readThread(id, originalFile, indexed, scopeEpoch = this.scopeEpoch, storageScopeId = this.scopeId) {
     const fs = require('node:fs/promises');
     const file = await this.safePath(originalFile);
+    if (scopeEpoch !== this.scopeEpoch) throw new Error('Storage scope changed');
     let handle;
     try {
       handle = await fs.open(file, 'r');
       const stat = await handle.stat();
+      if (scopeEpoch !== this.scopeEpoch) throw new Error('Storage scope changed');
       if (!stat.isFile() || !Number.isSafeInteger(stat.size)) return this.empty();
       const identity = `${stat.dev}:${stat.ino}`;
+      const previous = this.provenance.get(id);
+      const replaced = previous && (previous.file !== file || previous.identity !== identity || stat.size < previous.size
+        || stat.size === previous.size && stat.mtimeMs !== previous.mtimeMs);
+      const generation = previous ? previous.generation + (replaced ? 1 : 0) : 0;
+      const revision = require('node:crypto').createHash('sha256').update(`${storageScopeId}\0${file}\0${identity}\0${generation}`).digest('hex');
+      this.provenance.delete(id); this.provenance.set(id, { file, identity, size: stat.size, mtimeMs: stat.mtimeMs, generation });
+      while (this.provenance.size > this.maxCachedThreads) this.provenance.delete(this.provenance.keys().next().value);
       let state = this.cache.get(id);
       if (!state || state.file !== file || state.identity !== identity || stat.size < state.offset
         || stat.size === state.offset && state.mtimeMs !== null && stat.mtimeMs !== state.mtimeMs) state = this.state(file, identity);
+      if (replaced) state.indexInvalidated = true;
       this.cache.delete(id); this.cache.set(id, state);
       if (state.tailSize !== stat.size || state.mtimeMs !== stat.mtimeMs) {
         state.tailResult = await this.tail(handle, stat.size, id);
+        if (scopeEpoch !== this.scopeEpoch) throw new Error('Storage scope changed');
         state.tailSize = stat.size;
       }
       const began = Date.now();
@@ -294,11 +350,14 @@ class ThreadMetricsReader {
       while (!this.stopped && state.offset < stat.size && scanned < this.maxScanBytes && Date.now() - began < this.maxScanMs) {
         const buffer = Buffer.alloc(Math.min(this.chunkBytes, stat.size - state.offset, this.maxScanBytes - scanned));
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, state.offset);
+        if (scopeEpoch !== this.scopeEpoch) throw new Error('Storage scope changed');
         if (!bytesRead) break;
         this.consume(state, buffer.subarray(0, bytesRead), id);
         state.offset += bytesRead; scanned += bytesRead;
       }
       state.mtimeMs = stat.mtimeMs;
+      if (state.roundIds.size + state.responseIds.size + state.legacySnapshots.size + state.firstTokens.size
+        + state.calls.size + state.completedCalls.size > this.maxTrackedEvents) state.damagedCounters = state.damagedTools = true;
       const complete = state.offset === stat.size && !state.carryBytes && !state.skipping;
       // Prefix totals describe historical usage, not current cumulative usage.
       // Only a matching tail record may supply tokens while backfill is pending.
@@ -312,6 +371,29 @@ class ThreadMetricsReader {
       if (complete && state.recognized && !state.damagedTools && !state.calls.size) {
         result.toolDurationMs = state.intervals.reduce((sum, [start, end]) => sum + end - start, 0);
       }
+      let counterScope = complete && !state.damagedCounters ? 'full-history' : 'history-lower-bound';
+      if (result.rounds !== null && result.steps !== null) state.lastGoodCounters = { rounds: result.rounds, steps: result.steps };
+      else if (state.lastGoodCounters) {
+        result.rounds = state.lastGoodCounters.rounds; result.steps = state.lastGoodCounters.steps;
+        counterScope = 'last-complete-snapshot';
+      }
+      if (!complete && !state.damagedCounters && state.recognized) {
+        if (state.roundIds.size) result.rounds = Math.max(result.rounds ?? 0, state.roundIds.size);
+        if (state.steps) result.steps = Math.max(result.steps ?? 0, state.steps);
+      }
+      // A replaced/truncated rollout invalidates the old projection watermark,
+      // even when a new file happens to have the same byte length.
+      const usableIndex = !state.indexInvalidated && indexed && indexed.offset <= stat.size;
+      const indexedComplete = Boolean(usableIndex && indexed.offset === stat.size);
+      if (usableIndex) result.rounds = indexedComplete ? indexed.rounds : Math.max(result.rounds ?? 0, indexed.rounds);
+      Object.assign(result, {
+        backfilling: state.offset < stat.size,
+        counterScope, countersLowerBound: !complete || state.damagedCounters,
+        roundsComplete: indexedComplete || complete && !state.damagedCounters && result.rounds !== null,
+        stepsComplete: complete && !state.damagedCounters && result.steps !== null,
+        revision, rolloutSize: stat.size, rolloutMtimeMs: stat.mtimeMs,
+        countersReset: Boolean(replaced),
+      });
       // task_complete.duration_ms includes tools, approvals and other waiting;
       // item durations omit model prefill. Neither is a valid model-request or
       // generation duration, so LLM time and token speed deliberately stay null.

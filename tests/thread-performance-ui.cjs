@@ -139,8 +139,8 @@ async function scalarValues(page) {
     await page.evaluate(() => window.__codexThreadMetrics.update({ ok: false, checkedAt: Date.now(), perThread: {} }));
     actual = await scalarValues(page);
     assert.equal(actual.llmDurationMs, '≈0.4s'); assert.equal(actual.tokensPerSecond, '≈250');
-    assert.equal(actual.rounds, ''); assert.equal(actual.firstTokenAvgMs, '');
-    assert.equal(await page.locator('[data-codex-thread-metrics]').getAttribute('data-state'), 'ready');
+    assert.equal(actual.rounds, '1'); assert.equal(actual.firstTokenAvgMs, '5.9s', 'idle reader failure retains logged values as history');
+    assert.equal(await page.locator('[data-codex-thread-metrics]').getAttribute('data-state'), 'cached');
     await page.evaluate(value => { window.fixtureClock = value; window.__codexThreadMetrics.refresh(); }, base + 100000);
     assert.equal((await scalarValues(page)).tokensPerSecond, '≈250', 'completed sample remains valid while native monitor stays connected during idle');
     await page.locator('[data-above-composer-conversation-id]').evaluate((element, id) => element.setAttribute('data-above-composer-conversation-id', id), B);

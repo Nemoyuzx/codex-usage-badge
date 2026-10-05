@@ -61,12 +61,16 @@ const records = [
     const initial = await reader.read([ids[0], ids[0], "');DROP TABLE threads;--", null]);
     assert.equal(initial.ok, true);
     assert.equal(initial.checkedAt, 123);
+    assert.match(initial.scopeId, /^[a-f0-9]{64}$/);
+    assert.equal(initial.perThread[ids[0]].localVerified, true);
     assert.equal(Object.keys(initial.perThread).length, 1);
     const values = initial.perThread[ids[0]];
-    assert.deepEqual(values, { rounds: 2, steps: 2, llmDurationMs: null, toolDurationMs: 5000,
+    const metricKeys = ['rounds', 'steps', 'llmDurationMs', 'toolDurationMs', 'firstTokenAvgMs', 'tokensPerSecond', 'cacheHitPercent', 'inputTokens', 'outputTokens', 'complete'];
+    assert.deepEqual(Object.fromEntries(metricKeys.map(key => [key, values[key]])), { rounds: 2, steps: 2, llmDurationMs: null, toolDurationMs: 5000,
       firstTokenAvgMs: 2000, tokensPerSecond: null, cacheHitPercent: 250 / 300 * 100,
       inputTokens: 300, outputTokens: 30, complete: true });
-    assert.doesNotMatch(JSON.stringify(initial), /PRIVATE|私人|arguments|prompt|rollout|response-a|call-a/);
+    assert.doesNotMatch(JSON.stringify(initial), /PRIVATE|私人|arguments|prompt|rollout_path|response-a|call-a/);
+    assert.equal(JSON.stringify(initial).includes(temp), false);
     assert.deepEqual(fs.readFileSync(file), originalFile, 'rollout reads must be read-only');
     assert.deepEqual(fs.readFileSync(dbFile), originalDB, 'database reads must be read-only');
     assert.equal(db.prepare('SELECT count(*) AS count FROM threads').get().count, 1);
@@ -77,8 +81,11 @@ const records = [
     fs.appendFileSync(file, third.slice(0, 50));
     const partial = (await reader.read([ids[0]])).perThread[ids[0]];
     assert.equal(partial.complete, false);
-    assert.equal(partial.rounds, null, 'partial lines cannot expose undercounted all-history statistics');
-    assert.equal(partial.steps, null);
+    assert.equal(partial.rounds, 3, 'completed lifecycle records can expose explicitly marked historical lower bounds');
+    assert.equal(partial.steps, 2);
+    assert.equal(partial.countersLowerBound, true);
+    assert.equal(partial.roundsComplete, false);
+    assert.equal(partial.backfilling, false, 'a partial line at EOF must not trigger an endless accelerated backfill timer');
     assert.equal(partial.toolDurationMs, null);
     assert.equal(partial.inputTokens, 300, 'the last completed cumulative usage record remains available');
     fs.appendFileSync(file, third.slice(50) + '\n');
@@ -88,11 +95,14 @@ const records = [
     assert.equal(appended.steps, 3);
     assert.equal(appended.inputTokens, 400);
     assert.equal(appended.outputTokens, 40);
+    assert.equal(appended.revision, values.revision, 'append-only updates must preserve the rollout revision');
 
     fs.writeFileSync(file, encode([metadata(ids[0]), event('task_started', { turn_id: 'replacement' })]));
     const truncated = (await reader.read([ids[0]])).perThread[ids[0]];
     assert.equal(truncated.rounds, 1);
     assert.equal(truncated.steps, 0);
+    assert.equal(truncated.countersReset, true);
+    assert.notEqual(truncated.revision, values.revision);
     assert.equal(truncated.inputTokens, null, 'file truncation clears previous usage');
     const replacement = file + '.new';
     fs.writeFileSync(replacement, encode([metadata(ids[0]), usage(ids[0], 'new-inode', total(1, 1, 0))]));
@@ -132,6 +142,12 @@ const records = [
     assert.deepEqual(fs.readFileSync(forkFile), Buffer.from(encode([metadata(ids[1]), event('task_started', { turn_id: 'inherited' }),
       usage(ids[1], 'inherited-response', total(500, 50, 300)), tool('function_call', 'parent-call', 1), tool('function_call_output', 'parent-call', 90000),
       metadata(ids[2]), event('task_started', { turn_id: 'own' }), usage(ids[2], 'own-response', total(10, 5, 0))])));
+    const explicitOwnUsage = usage(ids[2], 'own-after-parent-meta', total(10, 5, 0));
+    explicitOwnUsage.payload.turn_id = 'own-turn-after-inherited-meta';
+    fixture(ids[2], [metadata(ids[2]), metadata(ids[1]), explicitOwnUsage]);
+    const appendedParentMeta = (await reader.read([ids[2]])).perThread[ids[2]];
+    assert.equal(appendedParentMeta.steps, 1, 'explicit modern thread ownership survives appended inherited session metadata');
+    assert.equal(appendedParentMeta.rounds, 1, 'the modern usage turn ID reliably recovers its own round');
 
     // The tail can contain only a huge unrelated tool output. A scanned prefix
     // must then remain blank, even though its historical usage was valid.
@@ -181,8 +197,9 @@ const records = [
     assert.equal(dropped.toolDurationMs, null, 'an omitted tool interval must never appear as zero or a guessed value');
     fs.appendFileSync(hugeFile, '{"type":"event_msg","payload":{"type":"token_count", BAD JSON}\n');
     const malformed = (await smallLines.read([ids[3]])).perThread[ids[3]];
-    assert.equal(malformed.rounds, null);
-    assert.equal(malformed.steps, null);
+    assert.equal(malformed.rounds, 1, 'idle last-good counter snapshots survive unavailable new observations');
+    assert.equal(malformed.steps, 1);
+    assert.equal(malformed.countersLowerBound, true);
     assert.equal(malformed.inputTokens, 200, 'known cumulative metadata survives a damaged event');
 
     const outside = path.join(temp, 'outside.jsonl');
@@ -212,9 +229,83 @@ const records = [
     assert.equal(limited.rounds, null, 'the memory cap blanks exact counters rather than undercounting');
     assert.equal(limited.toolDurationMs, null);
     assert.equal(limited.inputTokens, 10);
+
+    fixture(ids[0], [metadata(ids[0]), event('task_started', { turn_id: 'indexed-a' }),
+      usage(ids[0], 'indexed-response-a', total(10, 1, 0)), event('task_started', { turn_id: 'indexed-b' }),
+      usage(ids[0], 'indexed-response-b', total(20, 2, 0))]);
+    const historyFile = path.join(temp, 'thread_history_1.sqlite');
+    const history = new DatabaseSync(historyFile);
+    history.exec('CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER); CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,error_json TEXT);');
+    history.prepare('INSERT INTO thread_history_projection_state VALUES (?,?)').run(ids[0], fs.statSync(file).size);
+    history.prepare('INSERT INTO thread_turns VALUES (?,?,?)').run(ids[0], 'indexed-a', 'PRIVATE ERROR BODY');
+    history.prepare('INSERT INTO thread_turns VALUES (?,?,?)').run(ids[0], 'indexed-b', 'PRIVATE ERROR BODY');
+    history.prepare('INSERT INTO thread_turns VALUES (?,?,?)').run(ids[1], 'foreign-inherited-turn', 'PRIVATE ERROR BODY');
+    const historyBefore = fs.readFileSync(historyFile);
+    const indexedReader = new ThreadMetricsReader({ home: temp, maxScanBytes: 1, maxScanMs: 1000 });
+    const indexed = (await indexedReader.read([ids[0]])).perThread[ids[0]];
+    assert.equal(indexed.complete, false);
+    assert.equal(indexed.backfilling, true);
+    assert.equal(indexed.rounds, 2, 'the complete lifecycle index supplies immediate rounds while huge rollouts backfill');
+    assert.equal(indexed.roundsComplete, true);
+    assert.equal(indexed.steps, null);
+    assert.equal(indexed.stepsComplete, false);
+    assert.deepEqual(fs.readFileSync(historyFile), historyBefore, 'the lifecycle index is read-only');
+    assert.doesNotMatch(JSON.stringify(indexed), /PRIVATE/);
+    history.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset = next_rollout_byte_offset - 1').run();
+    const lagged = (await indexedReader.read([ids[0]])).perThread[ids[0]];
+    assert.equal(lagged.rounds, 2);
+    assert.equal(lagged.roundsComplete, false, 'an index watermark behind the rollout is an explicit lower bound');
+    const futureHistoryFile = path.join(temp, 'thread_history_2.sqlite');
+    const futureHistory = new DatabaseSync(futureHistoryFile); futureHistory.exec('CREATE TABLE unknown(id TEXT)'); futureHistory.close();
+    const unknownHistory = (await new ThreadMetricsReader({ home: temp, maxScanBytes: 1 }).read([ids[0]])).perThread[ids[0]];
+    assert.equal(unknownHistory.rounds, null, 'a newer unknown lifecycle index cannot silently reuse an older version');
+    fs.unlinkSync(futureHistoryFile); history.close();
+
+    db.exec('ALTER TABLE threads ADD COLUMN creator_account_id TEXT');
+    db.prepare('UPDATE threads SET creator_account_id=? WHERE id=?').run('PRIVATE ACCOUNT A', ids[0]);
+    const accountA = await reader.read([ids[0]]);
+    db.prepare('UPDATE threads SET creator_account_id=? WHERE id=?').run('PRIVATE ACCOUNT B', ids[0]);
+    const accountB = await reader.read([ids[0]]);
+    assert.equal(accountA.scopeId, accountB.scopeId, 'global storage scope stays stable across account owner metadata updates');
+    assert.notEqual(accountA.perThread[ids[0]].scopeId, accountB.perThread[ids[0]].scopeId, 'thread owner scopes must invalidate retained account data');
+    assert.doesNotMatch(JSON.stringify(accountA) + JSON.stringify(accountB), /PRIVATE ACCOUNT/);
+
+    // Pause old-scope file resolution while another refresh discovers a newer
+    // state database for the same UUID. The old promise must never get the new
+    // scope's ownership proof or overwrite its cache/provenance.
+    const racing = new ThreadMetricsReader({ home: temp, maxScanMs: 1000 });
+    const safePath = racing.safePath.bind(racing);
+    let entered, release;
+    const enteredPromise = new Promise(resolve => { entered = resolve; });
+    const releasedPromise = new Promise(resolve => { release = resolve; });
+    let pause = true;
+    racing.safePath = async value => {
+      if (pause) { pause = false; entered(); await releasedPromise; }
+      return safePath(value);
+    };
+    const oldScopeRead = racing.read([ids[0]]);
+    await enteredPromise;
+    const raceFile = path.join(sessions, 'rollout-race-new-scope.jsonl');
+    const raceUsage = usage(ids[0], 'race-new', total(900, 90, 800)); raceUsage.payload.turn_id = 'race-new-turn';
+    fs.writeFileSync(raceFile, encode([metadata(ids[0]), raceUsage]));
+    const newDatabase = new DatabaseSync(path.join(temp, 'state_7.sqlite'));
+    newDatabase.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)');
+    newDatabase.prepare('INSERT INTO threads VALUES(?,?)').run(ids[0], raceFile); newDatabase.close();
+    const newScopeRead = await racing.read([ids[0]]);
+    assert.equal(newScopeRead.perThread[ids[0]].inputTokens, 900);
+    release();
+    const discarded = await oldScopeRead;
+    assert.equal(discarded.ok, false);
+    assert.equal(Object.keys(discarded.perThread).length, 0, 'obsolete pending data cannot be relabeled with a new verified scope');
+    assert.equal(racing.cache.get(ids[0]).file, fs.realpathSync(raceFile), 'an old deferred scan cannot overwrite current-scope cache data');
+    assert.equal(racing.provenance.get(ids[0]).file, fs.realpathSync(raceFile));
+    racing.stop(); fs.unlinkSync(path.join(temp, 'state_7.sqlite'));
     const future = new DatabaseSync(path.join(temp, 'state_6.sqlite'));
     future.exec('CREATE TABLE other(id TEXT)'); future.close();
-    assert.equal((await reader.read([ids[0]])).ok, false, 'unknown newest state schema must not silently reuse an older account snapshot');
+    const unknownState = await reader.read([ids[0]]);
+    assert.equal(unknownState.ok, false, 'unknown newest state schema must not silently reuse an older account snapshot');
+    assert.match(unknownState.scopeId, /^[a-f0-9]{64}$/);
+    assert.notEqual(unknownState.scopeId, initial.scopeId, 'a known changed database scope must quarantine the older cache even if its schema is unsupported');
     fs.unlinkSync(path.join(temp, 'state_6.sqlite'));
     assert.equal((await reader.read([ids[0]])).ok, true);
     assert.equal((await new ThreadMetricsReader({ home: path.join(temp, 'missing') }).read([ids[0]])).ok, false);

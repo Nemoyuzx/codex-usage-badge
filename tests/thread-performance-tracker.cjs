@@ -38,6 +38,9 @@ const finishModel = (tracker, id, at, type = 'reasoning', turnId = 'turn-a') => 
   assert.equal(snapshot.llmDurationMs, 1100, 'one response uses earliest model start through usage arrival, not a sum of item timers');
   assert.equal(snapshot.tokensPerSecond, 200, 'real total output includes reasoning and arguments rather than character estimates');
   assert.equal(snapshot.observedResponses, 1);
+  assert.equal(snapshot.observedRounds, 1);
+  assert.equal(snapshot.observedSteps, 1);
+  assert.equal(snapshot.countersLowerBound, true);
   assert.equal(snapshot.timingApproximate, true);
   assert.equal(snapshot.observedSince, 1000);
   assert.equal(snapshot.lastSampleAt, 2200);
@@ -46,6 +49,48 @@ const finishModel = (tracker, id, at, type = 'reasoning', turnId = 'turn-a') => 
   assert.equal(tracker.snapshot(thread).observedResponses, 1, 'mirrored usage notifications must not recount the response');
   assert.equal(item(tracker, 'item/started', 'reasoning-a', 'reasoning', 1100, 2300), false, 'replayed historical starts cannot become new windows');
   assert.equal(tracker.snapshot(thread).llmDurationMs, 1100);
+}
+
+{
+  clock = 1000;
+  const tracker = make();
+  assert.equal(tracker.snapshot(thread).observedRounds, null);
+  assert.equal(tracker.snapshot(thread).observedSteps, null, 'missing source events cannot invent a zero count');
+  tokens(tracker, 0, 0, 0, 1050);
+  tokens(tracker, 0, 0, 0, 1060);
+  assert.equal(tracker.snapshot(thread).observedSteps, null, 'zero initialization snapshots are not completed model responses');
+  assert.equal(tokens(tracker, 100, 100, 100, 1100), false);
+  assert.equal(tokens(tracker, 100, 100, 100, 1200), false);
+  assert.equal(tokens(tracker, 200, 200, 100, 1300), false);
+  assert.equal(tracker.snapshot(thread).observedSteps, 2, 'live model completion counts do not depend on valid timing windows');
+  assert.equal(tracker.snapshot(thread).observedResponses, 0);
+  assert.equal(tracker.snapshot(thread).observedRounds, null);
+  startTurn(tracker, 'turn-a', 1400);
+  startTurn(tracker, 'turn-a', 1450);
+  send(tracker, 'turn/completed', { threadId: thread, turn: { id: 'turn-a', status: 'completed' } }, 1500);
+  assert.equal(tracker.snapshot(thread).observedRounds, 1, 'started/completed notifications identify one unique round');
+  startTurn(tracker, 'turn-b', 1600);
+  tokens(tracker, 300, 300, 100, 1700, 'turn-b');
+  assert.equal(tracker.snapshot(thread).observedRounds, 2);
+  assert.equal(tracker.snapshot(thread).observedSteps, 3);
+  send(tracker, 'turn/completed', { threadId: thread, turn: { id: 'turn-b', status: 'failed' } }, 1800);
+  assert.equal(tracker.snapshot(thread).observedRounds, 2, 'timing failure resets cannot erase observed native lifecycle counts');
+  assert.equal(tracker.snapshot(thread).observedSteps, 3);
+  assert.equal(tracker.snapshot(thread).countersObservedSince, 1000);
+  assert.equal(tracker.snapshot(thread).countersScope, 'since-monitor-start');
+  tracker.reset(thread);
+  assert.equal(tracker.snapshot(thread).observedRounds, null, 'explicit disconnect/reset begins a new count epoch');
+  assert.equal(tracker.snapshot(thread).observedSteps, null);
+}
+
+{
+  clock = 1000;
+  const tracker = make({ maxCounterEvents: 2 });
+  tokens(tracker, 100, 100, 100, 1100);
+  tokens(tracker, 200, 200, 100, 1200);
+  tokens(tracker, 300, 300, 100, 1300);
+  assert.equal(tracker.snapshot(thread).observedSteps, 2, 'bounded deduplication storage leaves an explicit lower bound at its limit');
+  assert.equal(tracker.snapshot(thread).countersLowerBound, true);
 }
 
 {
