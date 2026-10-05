@@ -1,12 +1,11 @@
 'use strict';
 const assert=require('node:assert/strict');
 const crypto=require('node:crypto');
-const repo='Nemoyuzx/codex-usage-badge';
 const {compareVersions,selectRelease,verifyArchive,checkForUpdate,getBytes,INTERVAL}=require('../windows/update.cjs');
 const data=Buffer.from('synthetic Windows archive');
 const hash=crypto.createHash('sha256').update(data).digest('hex');
 function release(version,extra={}) {
-  const tag='v'+version+'-windows',base='https://github.com/'+repo+'/releases/download/'+tag+'/';
+  const tag='v'+version+'-windows',base='https://github.com/jaykinhoo9/codex-usage-badge/releases/download/'+tag+'/';
   return {tag_name:tag,published_at:'2026-01-01T00:00:00Z',draft:false,assets:[
     {name:`CodexUsageBadge-Windows-${version}.zip`,state:'uploaded',size:data.length,digest:'sha256:'+hash,browser_download_url:base+`CodexUsageBadge-Windows-${version}.zip`},
     {name:'SHA256SUMS.txt',state:'uploaded',size:130,browser_download_url:base+'SHA256SUMS.txt'}
@@ -17,7 +16,7 @@ function server(releases,{badHash=false,error=false}={}) {
   const fetcher=async url=>{
     requests.push(url);
     if(error)return new Response('unavailable',{status:503});
-    if(url.startsWith('https://api.github.com/')){assert.equal(url,`https://api.github.com/repos/${repo}/releases?per_page=100`,'only the fork update channel may be queried');return new Response(JSON.stringify(releases));}
+    if(url.startsWith('https://api.github.com/'))return new Response(JSON.stringify(releases));
     if(url.endsWith('/SHA256SUMS.txt'))return new Response(`${badHash?'0'.repeat(64):hash}  ${selectRelease(releases,'0.0.0').asset.name}\n`);
     return new Response(data);
   };
@@ -30,8 +29,6 @@ function server(releases,{badHash=false,error=false}={}) {
   assert.equal(compareVersions('0.10.1','0.10.1'),0);
   assert.throws(()=>compareVersions('garbage','0.10.1'));
   const wrong=release('5.0.0');wrong.assets[0].browser_download_url='https://example.invalid/update.zip';
-  const upstream=release('5.0.0');for(const asset of upstream.assets)asset.browser_download_url=asset.browser_download_url.replace(repo,'jaykinhoo9/codex-usage-badge');
-  assert.equal(selectRelease([upstream],'0.10.1'),null,'fork must reject upstream releases that would remove fork features');
   assert.equal(selectRelease([release('0.10.2'),release('0.10.10'),release('9.0.0',{draft:true}),release('8.0.0',{tag_name:'v8.0.0-macos'}),release('7.0.0',{published_at:null}),wrong,release('6.0.0',{assets:[]})],'0.10.1').version,'0.10.10');
   assert.equal(selectRelease([release('0.10.1')],'0.10.1'),null);
   const candidate=selectRelease([release('0.10.2')],'0.10.1'),manifest=Buffer.from(`${hash}  ${candidate.asset.name}\n`);

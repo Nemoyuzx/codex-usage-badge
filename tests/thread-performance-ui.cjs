@@ -185,6 +185,20 @@ async function scalarValues(page) {
     await at(100700, 'thread/tokenUsage/updated', { threadId: A, turnId: nextTurn, tokenUsage: { total: tokens(200), last: tokens(100) } });
     await page.evaluate(() => window.__codexThreadMetrics.refresh());
     assert.equal((await scalarValues(page)).tokensPerSecond, '≈200', 'a late purge establishes a new eligible monitoring epoch instead of permanently disabling fresh samples');
+    await emit(page, 'thread/archived', { threadId: A });
+    await emit(page, 'thread/unarchived', { threadId: A });
+    await page.evaluate(({ id, value }) => {
+      window.fixtureClock = value;
+      window.__codexThreadMetrics.update({ ok: true, checkedAt: value,
+        perThread: { [id]: { localVerified: true, archived: false, complete: true } } });
+    }, { id: A, value: base + 100800 });
+    const batchedTurn = '00000000-0000-0000-0000-000000000098';
+    await at(101100, 'turn/started', { threadId: A, turn: { id: batchedTurn, status: 'inProgress' } });
+    await at(101202, 'item/started', { threadId: A, turnId: batchedTurn, item: { id: 'rs_after_batched_unarchive', type: 'reasoning' }, startedAtMs: base + 101200 });
+    await at(101401, 'item/completed', { threadId: A, turnId: batchedTurn, item: { id: 'rs_after_batched_unarchive', type: 'reasoning' }, completedAtMs: base + 101400 });
+    await at(101700, 'thread/tokenUsage/updated', { threadId: A, turnId: batchedTurn, tokenUsage: { total: tokens(300), last: tokens(100) } });
+    await page.evaluate(() => window.__codexThreadMetrics.refresh());
+    assert.equal((await scalarValues(page)).tokensPerSecond, '≈200', 'same-millisecond archive/unarchive keeps fresh monitoring eligible');
     await page.evaluate(() => {
       window.__codexThreadPerformance.destroy(); window.__codexThreadMetrics.destroy(); Date.now = window.realDateNow;
     });

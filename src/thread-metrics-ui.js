@@ -1,5 +1,5 @@
 function installThreadMetrics() {
-  const VERSION = 4;
+  const VERSION = 5;
   const KEY = '__codexThreadMetrics';
   const MARK = 'data-codex-thread-metrics';
   const ROOT = '[data-codex-composer-root][data-composer-placement="thread"]';
@@ -41,6 +41,7 @@ function installThreadMetrics() {
   const archivedIds = new Set();
   const archiveTimes = new Map();
   const unarchiveTimes = new Map();
+  const monitorEpochs = new Map();
   const awaitingUnarchiveProof = new Set();
   const pendingArchiveIds = new Map();
   const loaded = new Set();
@@ -296,6 +297,7 @@ function installThreadMetrics() {
     for (const id of Array.isArray(carried.archivedIds) ? carried.archivedIds : []) if (typeof id === 'string' && UUID.test(id)) archivedIds.add(id);
     for (const [id, at] of Array.isArray(carried.archiveTimes) ? carried.archiveTimes : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) archiveTimes.set(id, at);
     for (const [id, at] of Array.isArray(carried.unarchiveTimes) ? carried.unarchiveTimes : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) unarchiveTimes.set(id, at);
+    for (const [id, at] of Array.isArray(carried.monitorEpochs) ? carried.monitorEpochs : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) monitorEpochs.set(id, at);
     for (const id of Array.isArray(carried.awaitingUnarchiveProof) ? carried.awaitingUnarchiveProof : []) if (typeof id === 'string' && UUID.test(id)) awaitingUnarchiveProof.add(id);
     for (const [id, at] of Array.isArray(carried.pendingArchiveIds) ? carried.pendingArchiveIds : []) if (typeof id === 'string' && UUID.test(id) && validAt(at)) pendingArchiveIds.set(id, at);
     for (const value of Array.isArray(carried.records) ? carried.records : []) {
@@ -367,9 +369,9 @@ function installThreadMetrics() {
       const candidate = health?.supported === true && health.active === true && health.connected === true ? monitor.snapshot(id) : null;
       if (candidate?.timingApproximate === true && Number.isSafeInteger(candidate.observedResponses) && candidate.observedResponses > 0 &&
         validAt(candidate.observedSince) && validAt(candidate.lastSampleAt) && candidate.lastSampleAt >= candidate.observedSince &&
-        candidate.observedSince >= Math.max(accountChangedAt, archiveTimes.get(id) ?? 0, unarchiveTimes.get(id) ?? 0)) measured = candidate;
+        candidate.observedSince >= Math.max(accountChangedAt, monitorEpochs.get(id) ?? archiveTimes.get(id) ?? 0)) measured = candidate;
       if (candidate?.countersLowerBound === true && validAt(candidate.countersUpdatedAt) &&
-        validAt(candidate.countersObservedSince) && candidate.countersObservedSince >= Math.max(accountChangedAt, archiveTimes.get(id) ?? 0, unarchiveTimes.get(id) ?? 0)) counters = candidate;
+        validAt(candidate.countersObservedSince) && candidate.countersObservedSince >= Math.max(accountChangedAt, monitorEpochs.get(id) ?? archiveTimes.get(id) ?? 0)) counters = candidate;
     } catch { /* A missing or replaced monitor leaves only the file-backed values. */ }
     if (measured) for (const field of ['llmDurationMs', 'tokensPerSecond']) {
       if (remember(id, field, measured[field], { at: measured.lastSampleAt, source: 'monitor', approximate: true, lowerBound: false,
@@ -501,7 +503,9 @@ function installThreadMetrics() {
     if (cutoff > priorCutoff) {
       let since = null;
       try { since = window.__codexThreadPerformance?.snapshot?.(id)?.observedSince ?? null; } catch {}
-      if (!validAt(since) || since < cutoff) window.__codexThreadPerformance?.reset?.(id);
+      if (!validAt(since) || since < cutoff) {
+        const epoch = Date.now(); window.__codexThreadPerformance?.reset?.(id); monitorEpochs.set(id, epoch);
+      }
     }
     const record = history.get(id);
     if (record) {
@@ -571,7 +575,7 @@ function installThreadMetrics() {
     localProofs.delete(id); nativeProofs.delete(id); threadScopes.delete(id); loaded.delete(id); lastSerialized.delete(id);
     delete snapshot.perThread[id]; observedIds.add(id);
     if (typeof window.__codexThreadPerformance?.unarchiveThread === 'function') window.__codexThreadPerformance.unarchiveThread(id);
-    else window.__codexThreadPerformance?.reset?.(id);
+    const epoch = Date.now(); window.__codexThreadPerformance?.reset?.(id); monitorEpochs.set(id, epoch);
     refresh();
   }
   window[KEY] = {
@@ -656,7 +660,7 @@ function installThreadMetrics() {
     retainedState() { return { version: 1, producerId, scopeId, actorScopeId, actorEpochAt, scopeCheckedAt, accountChangedAt, accountBlocked,
       records: [...history.values()], proofIds: [...localProofs], nativeProofIds: [...nativeProofs], observedIds: [...observedIds], pending: this.pendingSnapshots(),
       archivedIds: [...archivedIds], archiveTimes: [...archiveTimes], unarchiveTimes: [...unarchiveTimes],
-      awaitingUnarchiveProof: [...awaitingUnarchiveProof], pendingArchiveIds: [...pendingArchiveIds] }; },
+      monitorEpochs: [...monitorEpochs], awaitingUnarchiveProof: [...awaitingUnarchiveProof], pendingArchiveIds: [...pendingArchiveIds] }; },
     status() { return { version: VERSION, placed: strip.isConnected && !strip.hidden && visible(strip),
       threadId, state: strip.dataset.state, available: [...values.values()].filter(el => el.textContent !== '').length,
       checkedAt: snapshot.checkedAt, ok: snapshot.ok, cachedThreads: history.size, pendingSnapshots: dirty.size,

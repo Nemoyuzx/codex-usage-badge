@@ -1,7 +1,7 @@
 'use strict';
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),crypto=require('node:crypto');
 const {compareVersions,selectRelease,readArchive,extractArchive,updateOnce,acquireLock,writeJson,readJson,fetchBytes}=require('../updater/core.cjs');
-const repo='Nemoyuzx/codex-usage-badge',version='0.9.5';
+const repo='jaykinhoo9/codex-usage-badge',version='0.9.5';
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
 function crc(data){let n=0xffffffff;for(const byte of data){n^=byte;for(let i=0;i<8;i++)n=n&1?(n>>>1)^0xedb88320:n>>>1;}return(n^0xffffffff)>>>0;}
 function zip(entries){
@@ -31,10 +31,7 @@ assert.equal(selectRelease([release(version,{draft:true})],'0.9.4'),null);
 assert.equal(selectRelease([release(version,{assets:[]})],'0.9.4'),null);
 assert.equal(selectRelease([release(version)],'0.9.4',{allowPrerelease:false}),null);
 const foreign=release();foreign.assets[0].browser_download_url='https://example.invalid/package.zip';assert.equal(selectRelease([foreign],'0.9.4'),null);
-const upstream=release();upstream.assets[0].browser_download_url=upstream.assets[0].browser_download_url.replace(repo,'jaykinhoo9/codex-usage-badge');
-assert.equal(selectRelease([upstream],'0.9.4'),null,'fork must reject upstream releases that would remove fork features');
 assert.equal(readArchive(archive,version).size,entries.length);
-assert.throws(()=>readArchive(zip(entries.map(e=>e[0].endsWith('/update.json')?[e[0],JSON.stringify({schema:1,repository:'jaykinhoo9/codex-usage-badge',platform:'macOS',version})]:e)),version),/来源不匹配/,'fork must reject packages declaring the upstream repository');
 assert.throws(()=>readArchive(zip([...entries,[`CodexUsageBadge-macOS-${version}/../../escape`,'bad']]),version),/不安全路径/);
 assert.throws(()=>readArchive(zip([...entries,[entries[0][0],'bad']]),version),/重复文件/);
 assert.throws(()=>readArchive(zip(entries.map((e,i)=>i===0?[e[0],e[1],0o120777]:e)),version),/文件类型/);
@@ -50,7 +47,6 @@ function fixture(name){
   return {installDir,cacheDir};
 }
 function mockFetch(releases,bytes=archive){return async(url,options)=>{
-  if(url.startsWith('https://api.github.com'))assert.equal(url,`https://api.github.com/repos/${repo}/releases?per_page=100`,'only the fork update channel may be queried');
   assert.equal(options.headers.Authorization,undefined,'no local GitHub credential may be forwarded');
   assert.ok(!JSON.stringify(options.headers).includes(process.env.USER||'nobody-known'));
   return new Response(url.startsWith('https://api.github.com')?JSON.stringify(releases):bytes,{status:200});

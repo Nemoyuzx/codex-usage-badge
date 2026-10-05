@@ -1,5 +1,5 @@
 function installThreadPerformanceMonitor(createTracker) {
-  const VERSION = 4;
+  const VERSION = 5;
   const KEY = '__codexThreadPerformance';
   if (window[KEY]?.version === VERSION) return;
   window[KEY]?.destroy?.();
@@ -92,7 +92,7 @@ function installThreadPerformanceMonitor(createTracker) {
           archivedIds.add(id); tracker.forget?.(id); trackedIds.delete(id);
           window.__codexThreadMetrics?.archiveThread?.(id);
         } else {
-          archivedIds.delete(id); tracker.forget?.(id); trackedIds.delete(id);
+          if (archivedIds.delete(id)) { tracker.reset(id); trackedIds.delete(id); }
           window.__codexThreadMetrics?.unarchiveThread?.(id);
         }
         return;
@@ -133,7 +133,7 @@ function installThreadPerformanceMonitor(createTracker) {
     version: VERSION,
     snapshot(id) { return !disposed && supported && connected && !paused && !archivedIds.has(id) && typeof id === 'string' && UUID.test(id) ? tracker.snapshot(id) : null; },
     archiveThread(id) { if (typeof id === 'string' && UUID.test(id)) { archivedIds.add(id); tracker.forget?.(id); trackedIds.delete(id); } },
-    unarchiveThread(id) { if (typeof id === 'string' && UUID.test(id)) { archivedIds.delete(id); tracker.forget?.(id); trackedIds.delete(id); } },
+    unarchiveThread(id) { if (typeof id === 'string' && UUID.test(id) && archivedIds.delete(id)) { tracker.reset(id); trackedIds.delete(id); } },
     reset(id) {
       if (typeof id === 'string' && UUID.test(id)) { tracker.reset(id); trackedIds.delete(id); }
       else clearMeasurements();
